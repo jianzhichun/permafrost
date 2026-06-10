@@ -13,10 +13,16 @@
 > 3. **Partial-prefix pre-warm can't hit** — a request must *fully* match a
 >    persisted cache prefix unit, so an anchor-only warm (shorter than a unit)
 >    never lands. Cross-session pre-warm on DeepSeek is impossible.
-> 4. **Claude Code busts its own cache** — it reshuffles tools when MCP servers
->    connect (tools render first → resets the prefix at byte 0), embeds a live
->    `git status` in the system block, and injects a per-request `cch=` nonce in a
->    billing-telemetry block.
+> 4. **DeepSeek keys on tool ORDER but tolerates the `cch` nonce.** Reordering the
+>    tool list (what churning MCP servers cause) drops the hit rate from **71% →
+>    33%** live, because tools render first and a reorder busts the prefix at
+>    byte 0. The per-request `cch=` billing nonce, by contrast, does *not* bust it.
+>
+> **Honest scope (head-to-head, live):** a *vanilla* Claude Code session already
+> hits ~90% on bare DeepSeek (its system prompt is globally shared and stays
+> warm), and Permafrost makes **no difference** there. Permafrost's value is the
+> tool-churn / MCP case (33% → 71%), customized non-shared anchors, and cold
+> parallel fan-out. If you run plain single-agent CC, you don't need it.
 >
 > Everything below is how we established each of these against the live API.
 
@@ -143,6 +149,45 @@ run — **15/15 passed**:
 Session total across the whole suite: **71% hit / 68% cost saved** — higher than
 the single 4-turn task's 66%, because the longer, multi-phase flow amortizes the
 unavoidable cold start, confirming the ceiling note below.
+
+## Finding 6 — the decisive head-to-head: where Permafrost helps, and where it doesn't
+
+A Reddit reader pointed out that bare DeepSeek already hits 90%+ without any
+plugin. They were right, and chasing it down is the most important thing we
+measured. Two clean, live, bare-vs-Permafrost A/Bs:
+
+**Vanilla session (10-turn fix-the-bug task, stable tools, no MCP).** Bare
+DeepSeek (off-mode proxy = transparent passthrough + metering) vs Permafrost
+(aggressive), same task:
+
+```
+bare DeepSeek   89.6% hit
+Permafrost      89.6% hit   ← identical
+```
+
+No difference. Why: Claude Code's system prompt + built-in tools (~20K tokens)
+are identical across all users, so that anchor is **globally warm** on DeepSeek —
+the first request of any session already hits it. The transforms Permafrost
+applies (tool sort, `cache_control` strip, env freeze, `cch` pin) are all no-ops
+here because DeepSeek tolerates what they fix.
+
+**Tool-churn session (`e2e/tool_order_ab.py`).** Fixed system + messages, only the
+tool *order* varies — what an MCP server reshuffling its tool list produces:
+
+```
+bare (tool order rotates each request)   33% hit
+Permafrost (tools always sorted)         71% hit   ← ~2.1×
+```
+
+Here Permafrost wins decisively, because **DeepSeek keys on tool order** and tools
+render first, so any reorder busts the prefix at byte 0.
+
+**Conclusion, stated plainly:** Permafrost is *not* a universal win. For a vanilla
+single-agent CC session, DeepSeek's globally-warm cache already does the job and
+Permafrost adds nothing. Its real, measured value is the workloads where the
+anchor isn't that shared-warm one — MCP tool churn (33%→71%), heavy customization,
+and cold parallel fan-out. The README leads with this, not with a blanket savings
+number.
 
 ## Honest ceiling
 

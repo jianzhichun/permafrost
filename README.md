@@ -6,368 +6,175 @@
         freeze the prefix · melt the bill
 </pre></div>
 
-<p align="center"><strong>A Claude Code plugin that freezes your prompt prefix so DeepSeek's automatic cache always hits.</strong></p>
+<p align="center"><strong>A Claude Code plugin that keeps DeepSeek's prompt cache hitting when Claude Code would otherwise bust it.</strong></p>
 
-<p align="center">
-  cache-stable passthrough proxy · deterministic tool order · volatile-content relocation · live hit-rate statusline · zero deps
-</p>
-
-<p align="center"><strong>Every $100 of Claude API traffic runs for ~$3.20 through Permafrost + DeepSeek — same requests, live-measured.</strong><br/><sub>~11× of that is just DeepSeek's pricing; Permafrost earns the rest by keeping the cache hitting on agentic traffic (MCP tools, subagents, idle gaps) where it otherwise busts toward ~$8.80.</sub></p>
+<p align="center">cache-stable passthrough proxy · deterministic tool order · env freeze+delta · cold-anchor coalescing · live hit-rate statusline · zero deps</p>
 
 ---
 
-Point Claude Code at DeepSeek and you get a coding agent for cents on the dollar
-— *if* DeepSeek's cache keeps hitting. It usually doesn't. Claude Code reshuffles
-its tool list when MCP servers connect, bakes today's date and a live `git
-status` into the system prompt, slides `cache_control` markers around, and — under
-a custom endpoint — stops deferring tools and re-inlines the whole tool set every
-turn. Every one of those changes the **front** of the request, and DeepSeek's
-cache only hits on a prefix that matches **from byte 0**. So you quietly pay the
-full (≈50×) miss price on tokens that should have been ~free.
-
-**Permafrost** sits between Claude Code and DeepSeek and rewrites the
-cache-relevant bytes of every request so the `tools + system` anchor stays
-byte-identical turn after turn — then streams the reply straight back.
+Pointing Claude Code at DeepSeek's Anthropic-compatible endpoint is cheap, and a
+**vanilla session already hits DeepSeek's cache ~90% on its own** — CC's system
+prompt is shared across users, so it stays warm. The cache breaks when your
+**tool list isn't stable**: MCP servers connect and reshuffle it, and because
+tools render *first* in the cached prefix, any reorder busts everything from
+byte 0. Permafrost sits between CC and DeepSeek and rewrites the cache-relevant
+bytes so the `tools + system` anchor stays byte-identical turn after turn — then
+streams the reply straight back.
 
 ```
   Claude Code ──Anthropic /v1/messages──▶ Permafrost ──▶ DeepSeek /anthropic
-   (unchanged)        127.0.0.1:8787     freeze prefix       (no translation —
-                                          + record hits       both speak Anthropic)
+   (unchanged)        127.0.0.1:8787     freeze prefix       (both speak Anthropic,
+                                          + record hits        no translation)
 ```
 
-## The math: same workload, four ways
+## Do you actually need it?
 
-The exact token traffic from our real Claude Code e2e run (4 requests: 41,728
-cache-hit + 21,339 cache-miss input tokens, 591 output tokens), priced four ways
-at current official rates:
+We ran **bare DeepSeek vs Permafrost head-to-head on the live API** and read
+DeepSeek's real cache tokens. The honest result is two-sided:
 
-| Same workload on… | Cost | vs. Claude w/ caching |
+| Your Claude Code session | bare DeepSeek | + Permafrost |
 |---|---:|---:|
-| Claude Sonnet 4.6, caching busted | $0.1981 | — |
-| Claude Sonnet 4.6, native caching working (66% hit) | $0.1014 | 1× |
-| DeepSeek v4-flash, cache busted (the agentic-churn case) | $0.00896 † | **11× cheaper** |
-| **DeepSeek v4-flash + Permafrost (66% hit)** | **$0.00324 †** | **31× cheaper (−96.8%)** |
+| Vanilla — stable tools, no MCP (10-turn task) | 89.6% hit | 89.6% — **no difference** |
+| Tool list churns — MCP servers reshuffle it | **33% hit** | **71% hit** |
 
-† live-measured token counts (41,728 hit + 21,339 miss + 591 output), priced at
-official rates. The 31× factors into **11× from DeepSeek's pricing × 2.8× from
-Permafrost** keeping the cache hitting. Unit prices (USD/1M): cache-hit input
-$0.30 vs **$0.0028** (107×), miss input $3.00 vs $0.14 (21×), output $15 vs $0.28
-(54×). On the Opus tier (`claude-opus*` maps to v4-pro) the same workload goes
-$0.169 → $0.0099, **17× cheaper**.
+**If you run plain single-agent CC, you don't need this** — DeepSeek already does
+the job. Permafrost earns its keep on the second row: tool churn busts the prefix
+at byte 0 and bare collapses to 33%; the deterministic sort holds it at 71%
+(reproduce: [`e2e/tool_order_ab.py`](e2e/tool_order_ab.py)). So it's for users with
+**MCP servers**, heavily **customized** setups whose anchor isn't the shared-warm
+one, or **parallel subagent fan-outs** on cold anchors.
 
-A neat cross-check: Claude Code itself priced one of our e2e requests at
-`total_cost_usd: $0.0625` (its own Sonnet-rate accounting); the same request
-through Permafrost → DeepSeek billed **$0.0029**.
-
-> **Honest caveats:**
-> 1. This compares *price for identical traffic*, not model quality —
->    `deepseek-v4-flash` is not Claude Sonnet 4.6; whether the trade is worth it
->    is your call.
-> 2. API-metered vs. API-metered; Claude Max subscriptions price differently.
-> 3. The two factors are not equal. **Rows 1→3 (≈11×) are DeepSeek's pricing,
->    independent of Permafrost.** Rows 3→4 (the 2.8× / −64%) is Permafrost keeping
->    the cache hitting on *realistic agentic traffic* — MCP tool churn, parallel
->    subagents, idle gaps — where bare DeepSeek's prefix busts toward all-miss
->    (offline benchmark: `off` = **0%** under tool churn; live: fan-out **0%→73%**,
->    keepalive **99.9%**). On a trivial single-agent session with stable tools and
->    no parallelism, bare DeepSeek already caches and Permafrost's margin is small —
->    its value is exactly the busting workloads.
-
-## Proof
-
-**The headline: every feature, one live run — real Claude Code + real DeepSeek.**
-[`e2e/run_full_suite.sh`](e2e/run_full_suite.sh) drives headless `claude -p`
-through Permafrost across six phases with hard assertions. Latest run **15/15
-passed**, session total **71% cache hit / 68% cost saved**:
-
-| Phase | What's asserted against the live API | Result |
-|---|---|---|
-| Alignment & freeze | multi-turn CC task hits ≥50%; env frozen into anchor; cch nonce pinned | 66% hit ✓ |
-| Coalescing (real) | a real 3-subagent fan-out actually coalesces | 2 followers held ✓ |
-| Coalescing (cold burst) | 3 concurrent cold requests, default settle | 65% hit ✓ |
-| Keepalive + resume | keepalive fires on idle; a resumed session reads the warm cache | fired 4×, resume **96%** hit ✓ |
-| Warm endpoint | unchanged replay hits ≥90% | 99% ✓ |
-| Sessions & lineages | ≥2 session buckets; **0** within-lineage anchor churn | 3 buckets, 0 churn ✓ |
-| Doctor anchor-diff | a forced anchor change yields byte-level was/now | excerpts present ✓ |
-
-Quick single-task version (`e2e/run_claude_code.sh`): 66% hit / 64% cheaper on a
-4-turn task over ~85 KB / ~21 K tokens of genuine CC system prompt + tools. What
-these runs taught us about DeepSeek's cache (it re-renders before caching; cache
-identity includes the client header fingerprint; CC's per-request billing nonce)
-is in [`docs/e2e-findings.md`](docs/e2e-findings.md).
-
-("Cost saved" / "cheaper" here means *versus running the same tokens uncached* —
-the value of the cache Permafrost keeps hitting. On simple sessions DeepSeek
-caches much of that on its own; Permafrost's decisive contribution is the
-coalescing and keepalive phases above, and the tool-churn case where bare hit
-rate is 0%.)
-
-<details>
-<summary><b>Offline benchmark + earlier probes (no API key)</b></summary>
-
-Emulator rebuilt to match the live findings — it caches the **rendered** request
-(`tools → system → messages`, the order DeepSeek actually uses), unit-quantized,
-with params + header cache identity. 12-turn Claude-Code-shaped conversation;
-`off` = no alignment, `aggressive` = the default.
-
-| Scenario | Mode | Cache hit rate | Anchor resets | Cost (USD) |
-|---|---|---:|---:|---:|
-| C: realistic CC (tool churn + live git/env) | **off** | **0%** | 11 | $0.00829 |
-| C: realistic CC (tool churn + live git/env) | **aggressive** | **88.4%** | **0** | **$0.00174** |
-
-Because tools render *first*, a reshuffled tool list (MCP late-binding) busts the
-prefix at byte 0 — `off` caches nothing, `aggressive` (deterministic sort) holds
-88%. A faithfulness cross-check: the same traffic scores 88% under the rendered
-model but only ~5% under a naive raw-byte model — the raw model under-reports
-because real CC serializes `messages` first, bytes DeepSeek doesn't cache. The
-per-buster breakdown and the params-identity demo are in
-[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
-
-```bash
-python3 benchmarks/bench.py --turns 12            # reproduce (no API key)
-python3 benchmarks/bench.py --real                # + live DeepSeek probe (needs key)
-```
-
-**Live-validated** against the real `api.deepseek.com/anthropic` endpoint: a
-repeated prefix returns `hit=1536 miss=77` — a **95% cache hit** on the second
-identical request, confirming DeepSeek's automatic cache serves Permafrost's
-canonical request shape. (See [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).)
-
-**Validated with real Claude Code** (not synthetic requests): headless `claude -p`
-on a 4-turn fix-the-bug task, isolated, routed through Permafrost → DeepSeek —
-**66% cache hit rate, 64% cost reduction**, on ~85 KB / ~21 K tokens of genuine CC
-system prompt + tools. Reproduce: [`e2e/run_claude_code.sh`](e2e/run_claude_code.sh)
-(needs a funded `DEEPSEEK_API_KEY`). What this run taught us — including that
-DeepSeek re-renders before caching, and CC's per-request billing nonce — is in
-[`docs/e2e-findings.md`](docs/e2e-findings.md).
-
-**Validated through the proxy, too:** four real requests sent through Permafrost
-with *shuffled tool order and changing `git status` each time* — exactly the
-traffic that misses in `off` mode — were aligned to one frozen anchor
-(`prefix_resets=0`). Once the prefix was warm, DeepSeek served **~97%** of it
-from cache (a single warm request: `hit=2048`, `miss=55` → **97%**). The proxy
-held the anchor stable despite the naive-client churn — including over the
-`/v1/messages?beta=true` query-string path.
-
-> "Anchor resets" = how many times the `tools+system` prefix changed bytes across
-> the run. Each reset forces DeepSeek to re-read the whole prefix at full price.
-> Permafrost's job is to keep it at 0.
-
-</details>
-
-## Features
-
-| | |
-|---|---|
-| **Prefix alignment** | deterministic tool sort · `cache_control` strip · env freeze+delta · billing-nonce stabilization · canonical UTF-8 serialization |
-| **Cold-anchor coalescing** | parallel subagent fan-out shares one cache write instead of N cold misses |
-| **Idle keepalive** | opt-in per-session replay keeps the prefix warm through think-time gaps (parallel sessions all stay warm) |
-| **Live diagnostics** | `/permafrost:status` `:doctor` `:benchmark` savings statusline · per-session + per-lineage stats · byte-level anchor diffs |
-| **Engineering** | zero deps (stdlib Python) · pooled upstream connections (no per-request TLS) · loopback-only control endpoints · streaming passthrough |
-| **Distribution** | one-line plugin install · SessionStart auto-start hook · `permafrost wrap` / `up` / `status` / `doctor` / `warm` / `bench` CLI |
+**On cost:** DeepSeek is ~11× cheaper than Claude on pricing alone (cache-hit
+input $0.0028 vs $0.30 /1M) — that's DeepSeek, not us, the moment you switch
+endpoints. Permafrost's *additional* contribution is keeping the cache hitting
+when it would otherwise bust (the 33% → 71% roughly halves the bill on a
+tool-churning workload; on a vanilla session it adds ~0%). Price-for-identical-
+traffic, not a model-quality claim — `deepseek-v4-flash` is not Sonnet 4.6.
 
 ## Quick start
 
 ```bash
-# 1 — install (clone anywhere; the proxy is stdlib-only Python, no pip needed)
 git clone https://github.com/jianzhichun/permafrost && cd permafrost
-
-# 2 — launch Claude Code through Permafrost, pointed at DeepSeek
 export ANTHROPIC_API_KEY=sk-your-deepseek-key
-./cli/permafrost wrap            # starts the proxy, sets the env, execs `claude`
+./cli/permafrost wrap     # starts the proxy, sets env for the child only, execs claude
 ```
 
-`permafrost wrap` sets `ANTHROPIC_BASE_URL` + `ENABLE_TOOL_SEARCH=true` **for the
-child `claude` process only** — it never touches your shell or
-`~/.claude/settings.json`.
+`wrap` sets `ANTHROPIC_BASE_URL` + `ENABLE_TOOL_SEARCH=true` for the child `claude`
+process only — it never touches your shell or `~/.claude/settings.json`.
 
-**Prefer it persistent?** Copy the `env` block from
-[`settings.example.json`](settings.example.json) into `~/.claude/settings.json`,
-run `permafrost up`, then start `claude` normally. (Claude Code reads its env once
-at launch, so these must be set *before* `claude` starts.)
-
-### Install as a Claude Code plugin
-
-This repo is its own plugin marketplace — two commands inside Claude Code:
+**As a plugin** (gives you `/permafrost:*` commands, statusline, auto-start hook):
 
 ```
 /plugin marketplace add jianzhichun/permafrost
 /plugin install permafrost@permafrost
 ```
 
-(or from a shell: `claude plugin marketplace add jianzhichun/permafrost &&
-claude plugin install permafrost@permafrost`)
+**Persistent:** copy the `env` block from [`settings.example.json`](settings.example.json)
+into `~/.claude/settings.json`, run `permafrost up`, start `claude` normally. (CC
+reads its env once at launch — set these *before* it starts.)
 
-That gives you the `/permafrost:*` commands, the SessionStart auto-start hook,
-and the statusline script. The proxy itself is part of the plugin — `permafrost
-wrap` / the settings block above point Claude Code at it. Update later with
-`/plugin marketplace update permafrost`.
+## What it does
 
-## What it does, exactly
+On every `/v1/messages` request, the pipeline
+([`proxy/permafrost_align.py`](proxy/permafrost_align.py)) keeps the `tools+system`
+anchor byte-stable, then reads DeepSeek's real `prompt_cache_hit_tokens`:
 
-On every `/v1/messages` request, the alignment pipeline
-([`proxy/permafrost_align.py`](proxy/permafrost_align.py)):
+1. **sorts tools** deterministically — late-binding MCP servers can't reshuffle
+   position 0 of the prefix. *(This is the one that matters most — see above.)*
+2. **freezes the env block + emits deltas** — pins the first-seen env/context
+   block (cwd, date, `git status`) into the anchor; later turns send only changed
+   lines on the tail. `PERMAFROST_FREEZE_ENV=0` relocates the whole block instead.
+3. **strips `cache_control`** and **serializes canonically** — DeepSeek ignores
+   the markers; canonical bytes remove serialization drift.
 
-1. **strips `cache_control`** — DeepSeek ignores the markers; their drifting
-   positions are pure prefix noise.
-2. **sorts tools** deterministically — so late-binding MCP servers can't reshuffle
-   position 0 of the prefix.
-3. **freezes the env block + emits deltas** (aggressive mode) — pins the
-   first-seen environment/context block (cwd, platform, today's date,
-   `git status`) into the cached anchor, then on later turns sends only the
-   *lines that changed* on the tail. An unchanged env costs zero tokens per turn;
-   a changed one costs only its delta — instead of re-sending the whole block
-   every turn. (Set `PERMAFROST_FREEZE_ENV=0` to fall back to relocating the
-   whole block off the prefix instead.)
-4. **serializes canonically** — compact, UTF-8-faithful, stable bytes.
+Plus three runtime features (depth in [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md)):
 
-It then reads DeepSeek's `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
-straight off the response and tracks your live hit rate and dollar savings.
+- **Cold-anchor coalescing** — parallel `Task` subagents sharing a cold prefix
+  would all pay the miss price (DeepSeek's write is async); one leader warms the
+  cache, followers wait for its first byte. Live: 0% → 73%. `PERMAFROST_COALESCE=0` off.
+- **Idle keepalive** (opt-in) — replays each conversation's last request,
+  unchanged in body *and headers*, after `PERMAFROST_KEEPALIVE_S` idle, so a long
+  think-gap doesn't lose the prefix to eviction. Live: 99.9% on replay.
+- **Diagnostics** — `/permafrost:status` `:doctor` `:benchmark`, a savings
+  statusline (`❄ 88% cache hit · $0.12 saved`), per-session + per-lineage stats,
+  and byte-level anchor diffs (how we caught CC's per-request `cch` nonce).
 
-### Cold-anchor coalescing (for parallel subagents)
+The full catalogue of CC cache-busters it defends against:
+[`docs/cache-busters.md`](docs/cache-busters.md).
 
-DeepSeek writes its cache *asynchronously*, so when Claude Code fans out `Task`
-subagents — N requests sharing one brand-new prefix, fired at once — none can
-read what the others are still writing, and **all N pay the cold-miss price**.
-Permafrost coalesces them: the first request on an unseen anchor goes through as
-the "leader" and warms the cache; same-anchor requests are held until the
-leader's response starts streaming, then released to read the warm prefix.
-Single requests are never delayed (a lone request *is* the leader); only
-concurrent same-anchor bursts wait, with a timeout guard against a stuck leader.
-`/permafrost:doctor` reports how many followers it held. Toggle with
-`PERMAFROST_COALESCE=0`.
+## Validation
 
-Release timing is a measured trade-off: DeepSeek's cache write is asynchronous
-(our probes: ~4s after first byte still misses, ~6s hits), so followers wait a
-`PERMAFROST_COALESCE_SETTLE_MS` (default 2500) after the leader's first byte —
-the default is live-validated: a 3-request cold burst under default settings had
-**both followers hit in full** (settle 0 scored 0% on the same shape).
+`e2e/run_full_suite.sh` drives headless `claude -p` through Permafrost against
+**real DeepSeek** across six phases (alignment, coalescing, keepalive+resume,
+warm, sessions, anchor-diff) — latest run **15/15 passed**. That proves the
+mechanisms work end-to-end; the *value vs bare* is the head-to-head table above.
+What these runs taught us about DeepSeek's cache (it re-renders before caching;
+cache identity includes the client header fingerprint; it keys on tool order but
+tolerates the `cch` nonce) is in [`docs/e2e-findings.md`](docs/e2e-findings.md).
 
-**Live-validated:** 4 concurrent cold-anchor requests to real DeepSeek went from
-**0% hit (off)** — all four miss, 16,356 tokens at full price — to **73% hit
-(on)**, where one leader warmed the cache and three followers read it. The cost
-is latency: followers wait for the leader's first byte (plus an optional
-`PERMAFROST_COALESCE_SETTLE_MS` for DeepSeek's async write to land).
+<details><summary><b>Offline benchmark (no API key)</b></summary>
 
-### Idle keepalive (opt-in)
+Emulator faithful to the live findings — caches the **rendered** request
+(`tools → system → messages`), unit-quantized, with params + header identity.
+12-turn CC-shaped conversation:
 
-DeepSeek evicts cache entries that go unused, so a long think-time gap can leave
-your next turn paying full miss price on the whole conversation prefix. With
-`PERMAFROST_KEEPALIVE_S=<seconds>` set, the proxy replays the last request of
-**each conversation** (per-session slots, LRU-capped — parallel sessions all
-stay warm) — **unchanged, body and headers** — after that much idle time,
-re-reading the whole prefix at hit price (~2% of a miss). Off by default because it fires real
-billable requests autonomously. `permafrost warm` triggers the same replay
-manually. Live-validated at **99.9% hit** on a real CC request replay; the
-"unchanged, headers too" part is load-bearing — DeepSeek's cache identity
-includes the client's header fingerprint, and replays that differ in params or
-headers measurably miss (see [`docs/e2e-findings.md`](docs/e2e-findings.md)).
+| Scenario | `off` | `aggressive` |
+|---|---:|---:|
+| Tool churn + live git/env | **0%** hit | **88%** hit |
 
-### Per-session & per-lineage stats, with anchor diffs
+`off` caches nothing (reshuffled tools bust byte 0); `aggressive` (sort) holds 88%.
+`python3 benchmarks/bench.py --turns 12` to reproduce; `--real` adds a live probe.
+Details + the raw-byte-vs-rendered cross-check: [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
+</details>
 
-`/permafrost/stats` buckets usage by Claude Code session id, and tracks anchor
-churn per *lineage* (stable system+tools ancestry) — so CC's tool-less preflight
-calls don't pollute the churn signal, and multiple sessions through one proxy
-stay readable.
+## Reference
 
-When an anchor *does* change within a lineage, the doctor shows **exactly where
-the bytes diverged** (`diverged_at_byte` plus `was`/`now` excerpts). That makes
-Permafrost self-debugging against future Claude Code releases: a new volatile
-pattern shows up as a readable diff in `/permafrost:doctor`, not as a
-mysteriously sinking hit rate. (This is precisely how we caught CC's `cch=`
-billing nonce.)
+**Modes** (`PERMAFROST_MODE`): `aggressive` (default: sort + freeze + strip +
+canonical) · `safe` (no content moved) · `off` (passthrough, still meters).
 
-Full mechanism: [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md).
-The complete catalogue of Claude Code cache-busters it defends against —
-including the "random header" worry: [`docs/cache-busters.md`](docs/cache-busters.md).
-
-## Modes
-
-| `PERMAFROST_MODE` | Does | Use when |
-|---|---|---|
-| `aggressive` (default) | strip + sort + **relocate** + canonical | real coding sessions (git status changes every turn) |
-| `safe` | strip + sort + canonical (no content moved) | you've already moved volatile content out of `system` |
-| `off` | nothing (still records stats) | measuring your un-aligned baseline |
-
-## Plugin surface
-
-- **`/permafrost:status`** — live hit rate, token split, dollars saved.
-- **`/permafrost:doctor`** — what's busting the cache right now + how to fix it.
-- **`/permafrost:benchmark`** — run the cache benchmark from inside a session.
-- **`/permafrost:wrap`** — how to (re)launch CC through the proxy.
-- **Statusline** — `❄ 88% cache hit · $0.12 saved` ([`scripts/statusline.sh`](scripts/statusline.sh)).
-- **SessionStart hook** — auto-starts the proxy *only* when your session is
-  actually routed through it ([`hooks/session_start.sh`](hooks/session_start.sh)).
-
-## The env hardening (set before launching `claude`)
+**Env hardening** — set *before* launching `claude`:
 
 | Variable | Why |
 |---|---|
 | `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` | route CC through Permafrost |
-| `ENABLE_TOOL_SEARCH=true` | **critical** — without it, a custom base URL makes CC stop deferring tools and re-inline the full tool set every turn (a giant buster) |
-| `ANTHROPIC_MODEL` / `ANTHROPIC_SMALL_FAST_MODEL` | pin to names that map to one DeepSeek SKU (`claude-opus*`→v4-pro, `claude-sonnet*/haiku*`→v4-flash) |
-| `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` | fewer off-prefix one-off requests |
+| `ENABLE_TOOL_SEARCH=true` | **critical** — without it a custom base URL makes CC stop deferring tools and re-inline the whole set every turn |
+| `ANTHROPIC_MODEL` / `ANTHROPIC_SMALL_FAST_MODEL` | pin to one DeepSeek SKU (`claude-opus*`→v4-pro, `*sonnet/haiku*`→v4-flash) |
 
-## Compared to
-
-CCR routes models; LiteLLM warms Anthropic breakpoints; Headroom compresses and
-only *detects* prefix volatility; Reasonix is a separate agent. **None is a CC
-plugin that rewrites the request bytes to keep DeepSeek's prefix cache hitting.**
-Full survey: [`docs/landscape.md`](docs/landscape.md).
-
-## Configuration
+**Config** (env, all optional):
 
 | Env | Default | Meaning |
 |---|---|---|
-| `PERMAFROST_PORT` | `8787` | proxy listen port |
-| `PERMAFROST_UPSTREAM` | `https://api.deepseek.com/anthropic` | where to forward (any Anthropic-compatible endpoint works) |
-| `PERMAFROST_MODE` | `aggressive` | `off` / `safe` / `aggressive` |
-| `PERMAFROST_FREEZE_ENV` | `1` | freeze the env block into the anchor + emit only changed lines (`0` relocates the whole block) |
-| `PERMAFROST_NORMALIZE_BETA` | `1` | sort + dedup the `anthropic-beta` header (never adds/drops a flag) |
-| `PERMAFROST_COALESCE` | `1` | hold parallel cold-anchor requests until the first warms the cache (`0` disables) |
-| `PERMAFROST_COALESCE_TIMEOUT_S` | `30` | follower deadlock guard |
-| `PERMAFROST_COALESCE_SETTLE_MS` | `2500` | extra wait after release, to let DeepSeek's async cache write land |
-| `PERMAFROST_KEEPALIVE_S` | `0` (off) | opt-in: replay the last request unchanged after this much idle, keeping the prefix warm at hit price |
-| `PERMAFROST_KEEPALIVE_IDLE_STOP_S` | `7200` | stop keepalives after this much idle (abandoned-session guard) |
+| `PERMAFROST_PORT` | `8787` | listen port |
+| `PERMAFROST_UPSTREAM` | `…/anthropic` | upstream (any Anthropic-compatible endpoint) |
+| `PERMAFROST_FREEZE_ENV` | `1` | freeze env + delta (`0` = relocate whole block) |
+| `PERMAFROST_COALESCE` / `_SETTLE_MS` | `1` / `2500` | coalescing + async-write settle |
+| `PERMAFROST_KEEPALIVE_S` | `0` (off) | idle-replay interval |
 | `PERMAFROST_PRICES` | V4 Flash | `"hit,miss,output"` USD/1M for the cost readout |
 
-> The benchmark emulator measures byte-prefix overlap; DeepSeek matches a
-> *rendered-token* prefix. The two load-bearing transforms (tool sort, env
-> relocation) change the rendered prompt and are validated against the live API
-> above. `cache_control` stripping and canonical serialization are byte-level
-> insurance — harmless to DeepSeek, useful for byte-sensitive gateways.
+The proxy is zero-dependency stdlib Python, pools upstream connections (no
+per-request TLS), and refuses non-loopback clients on its `/permafrost/*` endpoints.
 
 ## Tests
 
 ```bash
-# offline (no key, run in CI):
-python3 tests/test_alignment.py     # prefix-stability properties
-python3 tests/test_proxy_units.py   # coalescer, keepalive, stats, sniffing
-python3 tests/test_cc_fixture.py    # regression vs a real-CC-shaped request
-bash    tests/proxy_smoke.sh        # mock-upstream e2e (alignment, GET, beta, query paths)
-bash    tests/coalesce_smoke.sh     # concurrency: 1 leader, N followers
-bash    tests/keepalive_smoke.sh    # idle replay fires, byte-faithful
+# offline (no key, in CI): alignment, proxy units, CC-fixture, emulator + 3 smokes
+python3 tests/test_alignment.py && python3 tests/test_proxy_units.py
+python3 tests/test_cc_fixture.py && python3 tests/test_emulator.py
+bash tests/proxy_smoke.sh && bash tests/coalesce_smoke.sh && bash tests/keepalive_smoke.sh
 
-# live (funded DEEPSEEK_API_KEY; a few cents):
-bash e2e/run_claude_code.sh         # quick: one real CC task, hit rate + savings
-bash e2e/run_full_suite.sh          # FULL: every feature asserted against real
-                                    # CC + real DeepSeek (alignment, coalescing,
-                                    # keepalive+resume, warm, sessions, diffs)
+# live (funded DEEPSEEK_API_KEY, a few cents):
+bash e2e/run_claude_code.sh    # one real CC task
+bash e2e/run_full_suite.sh     # every feature, asserted
+python3 e2e/tool_order_ab.py   # the decisive bare-vs-Permafrost test
 ```
-
-Engineering notes: the proxy keeps a pooled upstream connection per thread (no
-per-request TLS handshake), and the `/permafrost/*` control endpoints refuse
-non-loopback clients even if you bind the proxy wide.
 
 ## Credits
 
-Permafrost generalizes techniques proven in two excellent projects:
-**[DeepSeek-Reasonix](https://github.com/esengine/DeepSeek-Reasonix)** (the
-prefix-cache discipline and `prompt_cache_hit_tokens` accounting) and
-**[Headroom](https://github.com/chopratejas/headroom)** (the proxy interception
-pattern, canonical forwarding, and the `ENABLE_TOOL_SEARCH` finding). Where
-Headroom's `CacheAligner` *detects* volatile content, Permafrost *relocates* it.
-
-## License
+Generalizes techniques from **[DeepSeek-Reasonix](https://github.com/esengine/DeepSeek-Reasonix)**
+(prefix-cache discipline, `prompt_cache_hit_tokens` accounting) and
+**[Headroom](https://github.com/chopratejas/headroom)** (proxy interception,
+canonical forwarding, the `ENABLE_TOOL_SEARCH` finding). Where Headroom's
+CacheAligner *detects* volatile content, Permafrost *rewrites* it. Compared to
+CCR / LiteLLM / Headroom / Reasonix: [`docs/landscape.md`](docs/landscape.md).
 
 MIT — see [LICENSE](LICENSE).
