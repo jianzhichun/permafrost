@@ -1,5 +1,25 @@
 # Real Claude Code e2e — what running it actually revealed
 
+> **TL;DR — undocumented DeepSeek cache behavior we measured (useful even if you
+> never use Permafrost):**
+> 1. **DeepSeek re-renders before caching** — it caches the rendered request
+>    (`tools → system → messages`), not the raw JSON body. Claude Code serializes
+>    `messages` first, so raw byte-overlap between turns is ~6%, yet the hit rate
+>    is 66%. Body key order is irrelevant; the cacheable anchor is `tools`+`system`.
+> 2. **Cache identity includes the client's HTTP header fingerprint and request
+>    params** — a byte-identical body with different headers (or a changed
+>    `max_tokens`) hit **0%**; with the exact client headers, **99.9%**. A sidecar
+>    script never shares your agent's cache.
+> 3. **Partial-prefix pre-warm can't hit** — a request must *fully* match a
+>    persisted cache prefix unit, so an anchor-only warm (shorter than a unit)
+>    never lands. Cross-session pre-warm on DeepSeek is impossible.
+> 4. **Claude Code busts its own cache** — it reshuffles tools when MCP servers
+>    connect (tools render first → resets the prefix at byte 0), embeds a live
+>    `git status` in the system block, and injects a per-request `cch=` nonce in a
+>    billing-telemetry block.
+>
+> Everything below is how we established each of these against the live API.
+
 Synthetic requests prove the transforms; only running **real Claude Code** proves
 the thing works on real traffic and surfaces what real CC actually does. This is
 the authoritative validation. Reproduce with
