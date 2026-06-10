@@ -12,6 +12,8 @@
   cache-stable passthrough proxy · deterministic tool order · volatile-content relocation · live hit-rate statusline · zero deps
 </p>
 
+<p align="center"><strong>Every $100 of Claude API traffic runs for ~$3.20 through Permafrost + DeepSeek — same requests, live-measured. (~$8.80 without Permafrost.)</strong></p>
+
 ---
 
 Point Claude Code at DeepSeek and you get a coding agent for cents on the dollar
