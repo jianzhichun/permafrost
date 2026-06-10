@@ -58,6 +58,13 @@ repeated prefix returns `hit=1536 miss=77` — a **95% cache hit** on the second
 identical request, confirming DeepSeek's automatic cache serves Permafrost's
 canonical request shape. (See [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).)
 
+**Validated through the proxy, too:** four real requests sent through Permafrost
+with *shuffled tool order and changing `git status` each time* — exactly the
+traffic that misses in `off` mode — were aligned to one frozen anchor
+(`prefix_resets=0`). Once the prefix was warm, DeepSeek served **~97%** of it
+from cache (`hit=4096`, fresh `miss=111`). The proxy held the anchor stable
+despite the naive-client churn.
+
 > "Anchor resets" = how many times the `tools+system` prefix changed bytes across
 > the run. Each reset forces DeepSeek to re-read the whole prefix at full price.
 > Permafrost's job is to keep it at 0.
