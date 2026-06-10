@@ -125,6 +125,12 @@ concurrent same-anchor bursts wait, with a timeout guard against a stuck leader.
 `/permafrost:doctor` reports how many followers it held. Toggle with
 `PERMAFROST_COALESCE=0`.
 
+**Live-validated:** 4 concurrent cold-anchor requests to real DeepSeek went from
+**0% hit (off)** — all four miss, 16,356 tokens at full price — to **73% hit
+(on)**, where one leader warmed the cache and three followers read it. The cost
+is latency: followers wait for the leader's first byte (plus an optional
+`PERMAFROST_COALESCE_SETTLE_MS` for DeepSeek's async write to land).
+
 Full mechanism: [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md).
 The complete catalogue of Claude Code cache-busters it defends against —
 including the "random header" worry: [`docs/cache-busters.md`](docs/cache-busters.md).
