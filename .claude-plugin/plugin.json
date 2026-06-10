@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "permafrost",
   "displayName": "Permafrost",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Freeze Claude Code's prompt prefix so DeepSeek's automatic cache always hits. A passthrough proxy that stabilizes the exact request bytes CC emits — deterministic tool order, canonical JSON, volatile-content relocation — plus the env hardening that stops a custom endpoint from busting the cache.",
   "author": {
     "name": "jianzhichun",
