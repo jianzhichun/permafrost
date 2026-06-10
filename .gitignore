@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime state
+*.log
+*.pid
+.permafrost/
+benchmarks/*.real.json
+
+# OS / editor
+.DS_Store
+*.swp

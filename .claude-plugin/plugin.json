@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "permafrost",
+  "displayName": "Permafrost",
+  "version": "0.1.0",
+  "description": "Freeze Claude Code's prompt prefix so DeepSeek's automatic cache always hits. A passthrough proxy that stabilizes the exact request bytes CC emits — deterministic tool order, canonical JSON, volatile-content relocation — plus the env hardening that stops a custom endpoint from busting the cache.",
+  "author": {
+    "name": "jianzhichun",
+    "url": "https://github.com/jianzhichun"
+  },
+  "homepage": "https://github.com/jianzhichun/permafrost",
+  "repository": "https://github.com/jianzhichun/permafrost",
+  "license": "MIT",
+  "keywords": [
+    "deepseek",
+    "prompt-cache",
+    "prefix-cache",
+    "cache-hit",
+    "proxy",
+    "cost-optimization",
+    "claude-code"
+  ],
+  "commands": [
+    "./commands/status.md",
+    "./commands/doctor.md",
+    "./commands/benchmark.md",
+    "./commands/wrap.md"
+  ],
+  "hooks": "./hooks/hooks.json"
+}

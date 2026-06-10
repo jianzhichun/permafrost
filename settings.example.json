@@ -1,0 +1,21 @@
+{
+  "//": "Copy the `env` block into ~/.claude/settings.json (or .claude/settings.json in a project).",
+  "//1": "Claude Code reads these ONCE at process start, so set them before launching `claude`.",
+  "//2": "Point CC at the local Permafrost proxy; the proxy forwards to DeepSeek's Anthropic endpoint.",
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
+    "ANTHROPIC_API_KEY": "sk-your-deepseek-key",
+
+    "//3": "CRITICAL: a non-first-party base URL disables MCP tool search by default, which makes CC",
+    "//4": "stop deferring tools and re-inline the full tool set every turn — a giant prefix-cache buster.",
+    "//5": "Permafrost forwards tool_reference blocks, so keep tool search on:",
+    "ENABLE_TOOL_SEARCH": "true",
+
+    "//6": "Avoid model-name churn. DeepSeek maps claude-sonnet*/haiku* -> deepseek-v4-flash, claude-opus* -> deepseek-v4-pro.",
+    "ANTHROPIC_MODEL": "claude-sonnet-4-6",
+    "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-4-5",
+
+    "//7": "Quieter, more deterministic traffic = fewer off-path requests that never hit the cache.",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  }
+}

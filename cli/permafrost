@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""permafrost — manage the cache proxy and launch Claude Code through it.
+
+Subcommands:
+  up [--port N] [--mode M]   start the proxy in the background
+  down                        stop the proxy
+  status                      print live cache stats (hit rate, $ saved)
+  doctor                      print the alignment report + what's busting the cache
+  wrap [-- claude args...]    ensure the proxy is up, then exec `claude` pointed at it
+  bench [--turns N] [--real]  run the cache benchmark
+
+`wrap` sets ANTHROPIC_BASE_URL / ENABLE_TOOL_SEARCH only for the child `claude`
+process — it never mutates your shell or ~/.claude/settings.json.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROXY = os.path.join(ROOT, "proxy", "permafrost_proxy.py")
+BENCH = os.path.join(ROOT, "benchmarks", "bench.py")
+HOME = os.environ.get("PERMAFROST_HOME", os.path.expanduser("~/.permafrost"))
+PIDFILE = os.path.join(HOME, "proxy.pid")
+LOGFILE = os.path.join(HOME, "proxy.log")
+
+DEF_HOST = os.environ.get("PERMAFROST_HOST", "127.0.0.1")
+DEF_PORT = os.environ.get("PERMAFROST_PORT", "8787")
+
+
+def _base() -> str:
+    return f"http://{DEF_HOST}:{DEF_PORT}"
+
+
+def _get(path: str, timeout: float = 2.0) -> dict | None:
+    try:
+        with urllib.request.urlopen(_base() + path, timeout=timeout) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
+
+
+def _running() -> bool:
+    return _get("/permafrost/health") is not None
+
+
+def cmd_up(args: argparse.Namespace) -> int:
+    os.makedirs(HOME, exist_ok=True)
+    if _running():
+        print(f"permafrost already up at {_base()}")
+        return 0
+    env = dict(os.environ)
+    env["PERMAFROST_HOST"] = DEF_HOST
+    env["PERMAFROST_PORT"] = str(args.port or DEF_PORT)
+    if args.mode:
+        env["PERMAFROST_MODE"] = args.mode
+    if args.upstream:
+        env["PERMAFROST_UPSTREAM"] = args.upstream
+    log = open(LOGFILE, "ab")
+    proc = subprocess.Popen([sys.executable, PROXY], env=env, stdout=log, stderr=log,
+                            start_new_session=True)
+    with open(PIDFILE, "w") as f:
+        f.write(str(proc.pid))
+    # Wait for liveness.
+    for _ in range(50):
+        if _running():
+            h = _get("/permafrost/health") or {}
+            print(f"permafrost up  pid={proc.pid}  {_base()}  mode={h.get('mode')}  "
+                  f"upstream={h.get('upstream')}")
+            print(f"point Claude Code here:\n  ANTHROPIC_BASE_URL={_base()} "
+                  f"ENABLE_TOOL_SEARCH=true claude")
+            return 0
+        time.sleep(0.1)
+    print("permafrost failed to start; see", LOGFILE, file=sys.stderr)
+    return 1
+
+
+def cmd_down(_args: argparse.Namespace) -> int:
+    if not os.path.exists(PIDFILE):
+        print("permafrost not running (no pidfile)")
+        return 0
+    pid = int(open(PIDFILE).read().strip() or "0")
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+    os.remove(PIDFILE)
+    print(f"permafrost stopped (pid {pid})")
+    return 0
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    s = _get("/permafrost/stats")
+    if not s:
+        print("permafrost not reachable; run `permafrost up`")
+        return 1
+    print(f"mode={s['mode']}  upstream={s['upstream']}  requests={s['requests']}")
+    print(f"cache hit rate : {s['hit_rate']*100:.1f}%  "
+          f"({s['cache_hit_tokens']:,} hit / {s['cache_miss_tokens']:,} miss tokens)")
+    print(f"cost so far    : ${s['cost_usd']:.4f}  "
+          f"(${s['saved_usd']:.4f} saved, {s['saved_pct']:.0f}% vs all-miss)")
+    print(f"prefix resets  : {s['prefix_changes']}")
+    return 0
+
+
+def cmd_doctor(_args: argparse.Namespace) -> int:
+    d = _get("/permafrost/doctor")
+    if not d:
+        print("permafrost not reachable; run `permafrost up`")
+        return 1
+    print(json.dumps(d, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_wrap(args: argparse.Namespace) -> int:
+    if not _running():
+        rc = cmd_up(argparse.Namespace(port=None, mode=None, upstream=None))
+        if rc != 0:
+            return rc
+    env = dict(os.environ)
+    env["ANTHROPIC_BASE_URL"] = _base()
+    env.setdefault("ENABLE_TOOL_SEARCH", "true")
+    claude_args = args.claude_args
+    if claude_args and claude_args[0] == "--":
+        claude_args = claude_args[1:]
+    cmd = ["claude", *claude_args]
+    print(f"launching: ANTHROPIC_BASE_URL={_base()} ENABLE_TOOL_SEARCH=true {' '.join(cmd)}")
+    try:
+        os.execvpe("claude", cmd, env)
+    except FileNotFoundError:
+        print("`claude` not found on PATH. Set ANTHROPIC_BASE_URL yourself:", file=sys.stderr)
+        print(f"  export ANTHROPIC_BASE_URL={_base()} ENABLE_TOOL_SEARCH=true", file=sys.stderr)
+        return 127
+    return 0
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    cmd = [sys.executable, BENCH, "--turns", str(args.turns)]
+    if args.real:
+        cmd.append("--real")
+    if args.write:
+        cmd += ["--write", args.write]
+    return subprocess.call(cmd)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="permafrost", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("up"); p.add_argument("--port"); p.add_argument("--mode")
+    p.add_argument("--upstream"); p.set_defaults(fn=cmd_up)
+    sub.add_parser("down").set_defaults(fn=cmd_down)
+    sub.add_parser("status").set_defaults(fn=cmd_status)
+    sub.add_parser("doctor").set_defaults(fn=cmd_doctor)
+    p = sub.add_parser("wrap"); p.add_argument("claude_args", nargs=argparse.REMAINDER)
+    p.set_defaults(fn=cmd_wrap)
+    p = sub.add_parser("bench"); p.add_argument("--turns", type=int, default=12)
+    p.add_argument("--real", action="store_true"); p.add_argument("--write")
+    p.set_defaults(fn=cmd_bench)
+
+    args = ap.parse_args()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
