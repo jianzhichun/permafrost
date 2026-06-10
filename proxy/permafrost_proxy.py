@@ -47,8 +47,10 @@ Local introspection (GET):
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
+import ssl
 import sys
 import threading
 import time
@@ -74,6 +76,35 @@ _HOP_BY_HOP = {
     "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade",
     "accept-encoding",
 }
+
+# --- pooled upstream connections ---------------------------------------------
+# One persistent connection per proxy thread (ThreadingHTTPServer gives each
+# client connection its own thread, and Claude Code keeps its client connection
+# alive), so consecutive turns reuse the TCP+TLS session instead of paying a
+# fresh handshake (~100-300ms TTFT) every request.
+_UP = urllib.parse.urlsplit(UPSTREAM)
+_TL = threading.local()
+
+
+def _upstream_conn(fresh: bool = False) -> http.client.HTTPConnection:
+    conn = None if fresh else getattr(_TL, "conn", None)
+    if conn is None:
+        if _UP.scheme == "https":
+            conn = http.client.HTTPSConnection(_UP.hostname, _UP.port or 443, timeout=600)
+        else:
+            conn = http.client.HTTPConnection(_UP.hostname, _UP.port or 80, timeout=600)
+        _TL.conn = conn
+    return conn
+
+
+def _drop_upstream_conn() -> None:
+    conn = getattr(_TL, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    _TL.conn = None
 
 _SNIFF_HEAD = 1 << 18  # 256 KB — message_start (input/cache usage) lives here
 _SNIFF_TAIL = 1 << 16  # 64 KB  — message_delta (output usage) lives here
@@ -253,60 +284,75 @@ class Keepalive:
     keepalive is offered, and only the full unchanged body is replayed.
     """
 
+    _SLOT_CAP = 8  # parallel conversations kept warm at once (LRU)
+
     def __init__(self, interval_s: float, idle_stop_s: float, sender=None) -> None:
         self.interval_s = interval_s
         self.idle_stop_s = idle_stop_s
         self.sender = sender or self._http_send  # injectable for tests
         self.lock = threading.Lock()
-        self.body: dict | None = None
-        self.headers: dict[str, str] = {}
-        self.last_real = 0.0
-        self.last_fire = 0.0
-        self.last_anchor = ""
+        # One slot per conversation (keyed by CC session id), so parallel
+        # sessions through one proxy all stay warm, not just the most recent.
+        self.slots: dict[str, dict] = {}
         self.fires = 0
         self.hit = 0
         self.miss = 0
         self.errors = 0
 
     # -- recording real traffic ------------------------------------------------
-    def note_request(self, body: dict, headers: dict[str, str], anchor: str) -> None:
+    def note_request(self, body: dict, headers: dict[str, str], anchor: str,
+                     session: str | None = None) -> None:
         # Keep the client's FULL header set (minus hop-by-hop). Measured live:
         # replaying an identical body with only the auth headers misses the
         # original's cache — DeepSeek's cache identity includes the client's
         # header fingerprint, so the replay must look exactly like the client.
         kept = {k: v for k, v in headers.items()
                 if k.lower() not in _HOP_BY_HOP and k.lower() != "content-length"}
+        key = session or "(none)"
         with self.lock:
-            self.body = body
-            self.headers = kept
-            self.last_real = time.time()
-            self.last_anchor = anchor
+            self.slots.pop(key, None)  # re-insert = move to MRU position
+            self.slots[key] = {"body": body, "headers": kept,
+                               "last_real": time.time(), "last_fire": 0.0,
+                               "anchor": anchor}
+            while len(self.slots) > self._SLOT_CAP:
+                self.slots.pop(next(iter(self.slots)))
 
     # -- firing ---------------------------------------------------------------
-    def should_fire(self, now: float) -> bool:
-        if self.interval_s <= 0 or self.body is None or self.last_real == 0:
-            return False
-        idle = now - self.last_real
-        if idle < self.interval_s or idle > self.idle_stop_s:
-            return False
-        return (now - self.last_fire) >= self.interval_s
-
-    def fire(self) -> dict | None:
+    def due(self, now: float) -> list[str]:
+        """Slots whose conversation has idled one interval (but isn't abandoned)."""
+        if self.interval_s <= 0:
+            return []
+        out = []
         with self.lock:
-            if self.body is None:
+            for key, s in self.slots.items():
+                idle = now - s["last_real"]
+                if (self.interval_s <= idle <= self.idle_stop_s
+                        and now - s["last_fire"] >= self.interval_s):
+                    out.append(key)
+        return out
+
+    def fire(self, session: str | None = None) -> dict | None:
+        """Replay one slot's request UNCHANGED (most recent slot by default).
+
+        Measured on the live endpoint: a replay that differs in stream /
+        max_tokens / headers misses the original's cache entirely (params and
+        the client header fingerprint are part of DeepSeek's cache identity);
+        a byte-identical replay hits 99.8%+. The cost of an unchanged replay is
+        one regenerated reply at hit-price input.
+        """
+        with self.lock:
+            if not self.slots:
                 return None
-            body = dict(self.body)
-            headers = dict(self.headers)
-        # Replay the body UNCHANGED. Measured on the live endpoint: a replay that
-        # differs only in stream/max_tokens misses the original's cache entirely
-        # (DeepSeek keys cache identity on request params, not just the rendered
-        # prefix), while a byte-identical replay hits 99.8%. The cost of an
-        # unchanged replay is one regenerated reply at hit-price input.
-        self.last_fire = time.time()
+            key = session if session in self.slots else next(reversed(self.slots))
+            slot = self.slots[key]
+            body = dict(slot["body"])
+            headers = dict(slot["headers"])
+            slot["last_fire"] = time.time()
         try:
             usage = self.sender(body, headers)
         except Exception as e:  # noqa: BLE001 — a failed keepalive must never crash
-            self.errors += 1
+            with self.lock:
+                self.errors += 1
             if os.environ.get("PERMAFROST_VERBOSE") == "1":
                 sys.stderr.write(f"permafrost: keepalive failed: {e}\n")
             return None
@@ -332,21 +378,25 @@ class Keepalive:
         tick = max(0.5, min(30.0, self.interval_s / 4)) if self.interval_s > 0 else 30.0
         while True:
             time.sleep(tick)
-            if self.should_fire(time.time()):
-                self.fire()
+            for key in self.due(time.time()):
+                self.fire(key)
 
     def snapshot(self) -> dict:
         with self.lock:
             prices = _prices()
+            newest = next(reversed(self.slots)) if self.slots else None
+            idle = (round(time.time() - self.slots[newest]["last_real"], 1)
+                    if newest else None)
             return {
                 "enabled": self.interval_s > 0,
                 "interval_s": self.interval_s,
+                "slots": len(self.slots),
                 "fires": self.fires,
                 "errors": self.errors,
                 "hit_tokens": self.hit,
                 "miss_tokens": self.miss,
                 "cost_usd": round(pa.cost_usd(self.hit, self.miss, self.fires, prices), 6),
-                "idle_s": round(time.time() - self.last_real, 1) if self.last_real else None,
+                "idle_s": idle,
             }
 
 
@@ -530,9 +580,16 @@ class Handler(BaseHTTPRequestHandler):
         if os.environ.get("PERMAFROST_VERBOSE") == "1":
             super().log_message(*args)
 
+    def _is_loopback_client(self) -> bool:
+        return self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
     # --- local introspection + GET passthrough ------------------------------
     def do_GET(self) -> None:
         clean = urllib.parse.urlsplit(self.path).path
+        if clean.startswith("/permafrost/") and not self._is_loopback_client():
+            # Control endpoints stay local even if someone binds the proxy wide:
+            # /warm spends the user's money, /stats and /doctor leak metadata.
+            return self._json(403, {"error": "permafrost control endpoints are loopback-only"})
         if clean == "/permafrost/health":
             return self._json(200, {"ok": True, "mode": MODE, "upstream": UPSTREAM,
                                     "host": HOST, "port": PORT})
@@ -592,6 +649,8 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b""
 
         clean_path = urllib.parse.urlsplit(self.path).path
+        if clean_path.startswith("/permafrost/") and not self._is_loopback_client():
+            return self._json(403, {"error": "permafrost control endpoints are loopback-only"})
         if clean_path == "/permafrost/warm":
             usage = KEEPALIVE.fire()
             if usage is None:
@@ -610,7 +669,8 @@ class Handler(BaseHTTPRequestHandler):
                 body, report = pa.align_request(body, MODE, store=FREEZE_STORE)
                 out_bytes = pa.canonical_dumps(body)
                 STATS.record_request(report, session, pa.anchor_payload(body))
-                KEEPALIVE.note_request(body, dict(self.headers), report.anchor_fingerprint)
+                KEEPALIVE.note_request(body, dict(self.headers),
+                                       report.anchor_fingerprint, session)
                 if DUMP_DIR:
                     self._dump_anchor(body, report)
             except (ValueError, TypeError) as e:
@@ -665,33 +725,39 @@ class Handler(BaseHTTPRequestHandler):
     def _forward(self, method: str, out_bytes: bytes | None, report,
                  session: str | None = None, first_byte_cb=None) -> int | None:
         # self.path already carries /v1/... plus any query string; UPSTREAM ends
-        # at /anthropic, so the full URL is <upstream>/v1/messages[?query].
+        # at /anthropic, so the upstream path is <prefix>/v1/messages[?query].
         # Returns the upstream HTTP status, or None if the upstream was
         # unreachable (so a coalescing leader knows whether a cache write happened).
-        url = UPSTREAM + self.path if self.path.startswith("/") else UPSTREAM + "/" + self.path
+        prefix = _UP.path.rstrip("/")
+        path = prefix + (self.path if self.path.startswith("/") else "/" + self.path)
         headers = self._build_upstream_headers()
-        req = urllib.request.Request(url, data=out_bytes, headers=headers, method=method)
 
-        head = bytearray()
-        tail = bytearray()
-        try:
-            resp = urllib.request.urlopen(req, timeout=600)
-        except urllib.error.HTTPError as e:
-            resp = e
-        except urllib.error.URLError as e:
-            self._json(502, {"error": "upstream unreachable", "detail": str(e),
-                             "upstream": UPSTREAM})
-            return None
+        resp = None
+        for attempt in (0, 1):  # retry once on a stale pooled connection
+            conn = _upstream_conn(fresh=attempt > 0)
+            try:
+                conn.request(method, path, body=out_bytes, headers=headers)
+                resp = conn.getresponse()
+                break
+            except (http.client.HTTPException, BrokenPipeError, ConnectionResetError,
+                    ssl.SSLError, OSError) as e:
+                _drop_upstream_conn()
+                if attempt:
+                    self._json(502, {"error": "upstream unreachable", "detail": str(e),
+                                     "upstream": UPSTREAM})
+                    return None
 
-        status = getattr(resp, "status", 200) or 200
+        status = resp.status or 200
         self.send_response(status)
-        for k, v in resp.headers.items():
+        for k, v in resp.getheaders():
             if k.lower() in _HOP_BY_HOP or k.lower() == "content-length":
                 continue
             self.send_header(k, v)
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
 
+        head = bytearray()
+        tail = bytearray()
         first = True
         try:
             while True:
@@ -713,12 +779,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._write_chunk(chunk)
             self._write_chunk(b"")
         except (BrokenPipeError, ConnectionResetError):
+            # Client went away mid-stream: the pooled connection still has
+            # unread upstream data — drop it so the next request gets a clean one.
+            _drop_upstream_conn()
             return status
-        finally:
-            try:
-                resp.close()
-            except Exception:
-                pass
+        except (http.client.HTTPException, ssl.SSLError, OSError):
+            _drop_upstream_conn()
+            return status
 
         if report is not None:  # only meter aligned /v1/messages calls
             u_head = _sniff_usage(bytes(head).decode("utf-8", "replace"))

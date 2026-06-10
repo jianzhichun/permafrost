@@ -200,9 +200,10 @@ is latency: followers wait for the leader's first byte (plus an optional
 
 DeepSeek evicts cache entries that go unused, so a long think-time gap can leave
 your next turn paying full miss price on the whole conversation prefix. With
-`PERMAFROST_KEEPALIVE_S=<seconds>` set, the proxy replays the last request —
-**unchanged, body and headers** — after that much idle time, re-reading the
-whole prefix at hit price (~2% of a miss). Off by default because it fires real
+`PERMAFROST_KEEPALIVE_S=<seconds>` set, the proxy replays the last request of
+**each conversation** (per-session slots, LRU-capped — parallel sessions all
+stay warm) — **unchanged, body and headers** — after that much idle time,
+re-reading the whole prefix at hit price (~2% of a miss). Off by default because it fires real
 billable requests autonomously. `permafrost warm` triggers the same replay
 manually. Live-validated at **99.9% hit** on a real CC request replay; the
 "unchanged, headers too" part is load-bearing — DeepSeek's cache identity
@@ -287,9 +288,24 @@ Full survey: [`docs/landscape.md`](docs/landscape.md).
 ## Tests
 
 ```bash
-python3 tests/test_alignment.py     # pure, offline — prefix-stability properties
-bash    tests/proxy_smoke.sh        # isolated end-to-end (local mock upstream, throwaway ports)
+# offline (no key, run in CI):
+python3 tests/test_alignment.py     # prefix-stability properties
+python3 tests/test_proxy_units.py   # coalescer, keepalive, stats, sniffing
+python3 tests/test_cc_fixture.py    # regression vs a real-CC-shaped request
+bash    tests/proxy_smoke.sh        # mock-upstream e2e (alignment, GET, beta, query paths)
+bash    tests/coalesce_smoke.sh     # concurrency: 1 leader, N followers
+bash    tests/keepalive_smoke.sh    # idle replay fires, byte-faithful
+
+# live (funded DEEPSEEK_API_KEY; a few cents):
+bash e2e/run_claude_code.sh         # quick: one real CC task, hit rate + savings
+bash e2e/run_full_suite.sh          # FULL: every feature asserted against real
+                                    # CC + real DeepSeek (alignment, coalescing,
+                                    # keepalive+resume, warm, sessions, diffs)
 ```
+
+Engineering notes: the proxy keeps a pooled upstream connection per thread (no
+per-request TLS handshake), and the `/permafrost/*` control endpoints refuse
+non-loopback clients even if you bind the proxy wide.
 
 ## Credits
 

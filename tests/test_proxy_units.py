@@ -223,21 +223,41 @@ def test_keepalive_state_machine() -> None:
         return {"input": 1000, "hit": 990, "miss": 10, "output": 1}
 
     ka = pp.Keepalive(interval_s=10, idle_stop_s=100, sender=fake_sender)
-    assert not ka.should_fire(now=1000)            # nothing recorded yet
-    ka.note_request({"model": "m", "messages": [1]}, {"x-api-key": "k"}, "anch")
-    ka.last_real, ka.last_fire = 1000.0, 0.0       # deterministic clock
-    assert not ka.should_fire(1005)                # not idle long enough
-    assert ka.should_fire(1015)                    # idle one interval -> fire
-    assert not ka.should_fire(1150)                # past idle_stop -> abandoned
-    ka.last_fire = 1015.0                          # as if we just fired
-    assert not ka.should_fire(1020)                # within an interval of the fire
-    assert ka.should_fire(1026)                    # a full interval later again
-    u = ka.fire()
+    assert ka.due(1000) == []                      # nothing recorded yet
+    ka.note_request({"model": "m", "messages": [1]}, {"x-api-key": "k"}, "anch", "sess1")
+    slot = ka.slots["sess1"]
+    slot["last_real"], slot["last_fire"] = 1000.0, 0.0  # deterministic clock
+    assert ka.due(1005) == []                      # not idle long enough
+    assert ka.due(1015) == ["sess1"]               # idle one interval -> due
+    assert ka.due(1150) == []                      # past idle_stop -> abandoned
+    slot["last_fire"] = 1015.0                     # as if we just fired
+    assert ka.due(1020) == []                      # within an interval of the fire
+    assert ka.due(1026) == ["sess1"]               # a full interval later again
+    u = ka.fire("sess1")
     assert u and u["hit"] == 990 and ka.fires == 1
     # The replay must be UNCHANGED: a replay differing in stream/max_tokens
     # measurably misses the original's cache on DeepSeek (params are part of
     # cache identity).
     assert sent[0] == {"model": "m", "messages": [1]}
+
+
+def test_keepalive_per_session_slots() -> None:
+    fired: list[dict] = []
+    ka = pp.Keepalive(interval_s=10, idle_stop_s=100,
+                      sender=lambda b, h: (fired.append(b),
+                                           {"input": 1, "hit": 1, "miss": 0, "output": 1})[1])
+    ka.note_request({"id": "a"}, {}, "anch-a", "sa")
+    ka.note_request({"id": "b"}, {}, "anch-b", "sb")
+    assert len(ka.slots) == 2, "parallel sessions must each get a slot"
+    for s in ka.slots.values():
+        s["last_real"], s["last_fire"] = 1000.0, 0.0
+    assert sorted(ka.due(1015)) == ["sa", "sb"]    # both conversations stay warm
+    ka.fire("sa"); ka.fire("sb")
+    assert [b["id"] for b in fired] == ["a", "b"]
+    # LRU cap: a flood of sessions evicts the oldest
+    for i in range(ka._SLOT_CAP + 2):
+        ka.note_request({"id": i}, {}, "x", f"s{i}")
+    assert len(ka.slots) == ka._SLOT_CAP and "sa" not in ka.slots
 
 
 def _run_all() -> int:

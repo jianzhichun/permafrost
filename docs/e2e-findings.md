@@ -104,6 +104,26 @@ reported **zero false anchor resets** — the preflight call (no tools) and the
 agent loop are separate lineages, so their alternation no longer pollutes the
 churn signal. Within both lineages, transitions = 0 across all 7 requests.
 
+## Full-feature suite (every feature, one live run)
+
+[`e2e/run_full_suite.sh`](../e2e/run_full_suite.sh) exercises every feature
+against real Claude Code + real DeepSeek with hard per-phase assertions. Latest
+run — **15/15 passed**:
+
+| Phase | Asserted | Result |
+|---|---|---|
+| alignment & freeze | multi-turn CC task hits ≥50%; env frozen; cch pinned | 66.1% hit ✓ |
+| coalescing (real) | a real 3-subagent fan-out actually coalesces | 2 followers held ✓ |
+| coalescing (cold burst) | 3 concurrent cold requests, default settle | 65% hit, 2 held ✓ |
+| keepalive + resume | keepalive fires on idle; resumed session reads warm cache | fired 4×, resume **96%** hit ✓ |
+| warm endpoint | unchanged replay hits ≥90% | 99% ✓ |
+| sessions & lineages | ≥2 session buckets; **0** within-lineage churn | 3 buckets, 0 churn ✓ |
+| doctor anchor-diff | a forced anchor change yields byte-level was/now | excerpts present ✓ |
+
+Session total across the whole suite: **71% hit / 68% cost saved** — higher than
+the single 4-turn task's 66%, because the longer, multi-phase flow amortizes the
+unavoidable cold start, confirming the ceiling note below.
+
 ## Honest ceiling
 
 66% on a 4-turn task is near the practical maximum: the preflight and the first
