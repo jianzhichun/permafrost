@@ -27,6 +27,10 @@ Env:
                         one warms the cache (default 1); 0 disables
   PERMAFROST_COALESCE_TIMEOUT_S  follower deadlock guard (default 30)
   PERMAFROST_COALESCE_SETTLE_MS  extra wait after release for async cache (default 0)
+  PERMAFROST_KEEPALIVE_S  OPT-IN: replay the last request (max_tokens=1) after this
+                        many idle seconds to keep the cache warm (default 0 = off;
+                        fires real billable requests at ~hit price)
+  PERMAFROST_KEEPALIVE_IDLE_STOP_S  stop keepalives after this much idle (default 7200)
   PERMAFROST_PRICES     "hit,miss,output" USD per 1M to override the cost model
   PERMAFROST_DUMP_DIR   debug: write each aligned request's full body here, to
                         diff what a client varies between turns
@@ -212,6 +216,129 @@ class Coalescer:
 COALESCER = Coalescer(enabled=COALESCE, timeout_s=COALESCE_TIMEOUT_S,
                       settle_ms=COALESCE_SETTLE_MS, cap=COALESCE_CAP)
 
+KEEPALIVE_S = float(os.environ.get("PERMAFROST_KEEPALIVE_S", "0") or 0)
+KEEPALIVE_IDLE_STOP_S = float(os.environ.get("PERMAFROST_KEEPALIVE_IDLE_STOP_S", "7200"))
+
+
+class Keepalive:
+    """Keep the cache warm through idle gaps; support cross-session pre-warm.
+
+    DeepSeek evicts cache entries that go unused (TTL undocumented — hours-ish
+    under load). A long think-time gap mid-session can leave the next turn
+    paying full miss price on the whole prefix. When enabled (interval > 0),
+    this replays the most recent aligned request with `max_tokens: 1` whenever
+    the proxy has been idle for one interval — the entire prefix (anchor +
+    conversation) is re-read at hit price (~2% of miss), keeping it resident.
+
+    OPT-IN: it fires real billable requests autonomously, so the default is off.
+    It stops after `idle_stop_s` without real traffic (abandoned session guard).
+
+    Note on cross-session pre-warm: we measured it and it does NOT work on
+    DeepSeek — an anchor-only replay (tools+system + placeholder message) is
+    shorter than any persisted cache prefix unit, so it can never "fully match"
+    one; it returned 0 cache-read on the live API. Hence only same-conversation
+    keepalive is offered, and only the full unchanged body is replayed.
+    """
+
+    def __init__(self, interval_s: float, idle_stop_s: float, sender=None) -> None:
+        self.interval_s = interval_s
+        self.idle_stop_s = idle_stop_s
+        self.sender = sender or self._http_send  # injectable for tests
+        self.lock = threading.Lock()
+        self.body: dict | None = None
+        self.headers: dict[str, str] = {}
+        self.last_real = 0.0
+        self.last_fire = 0.0
+        self.last_anchor = ""
+        self.fires = 0
+        self.hit = 0
+        self.miss = 0
+        self.errors = 0
+
+    # -- recording real traffic ------------------------------------------------
+    def note_request(self, body: dict, headers: dict[str, str], anchor: str) -> None:
+        # Keep the client's FULL header set (minus hop-by-hop). Measured live:
+        # replaying an identical body with only the auth headers misses the
+        # original's cache — DeepSeek's cache identity includes the client's
+        # header fingerprint, so the replay must look exactly like the client.
+        kept = {k: v for k, v in headers.items()
+                if k.lower() not in _HOP_BY_HOP and k.lower() != "content-length"}
+        with self.lock:
+            self.body = body
+            self.headers = kept
+            self.last_real = time.time()
+            self.last_anchor = anchor
+
+    # -- firing ---------------------------------------------------------------
+    def should_fire(self, now: float) -> bool:
+        if self.interval_s <= 0 or self.body is None or self.last_real == 0:
+            return False
+        idle = now - self.last_real
+        if idle < self.interval_s or idle > self.idle_stop_s:
+            return False
+        return (now - self.last_fire) >= self.interval_s
+
+    def fire(self) -> dict | None:
+        with self.lock:
+            if self.body is None:
+                return None
+            body = dict(self.body)
+            headers = dict(self.headers)
+        # Replay the body UNCHANGED. Measured on the live endpoint: a replay that
+        # differs only in stream/max_tokens misses the original's cache entirely
+        # (DeepSeek keys cache identity on request params, not just the rendered
+        # prefix), while a byte-identical replay hits 99.8%. The cost of an
+        # unchanged replay is one regenerated reply at hit-price input.
+        self.last_fire = time.time()
+        try:
+            usage = self.sender(body, headers)
+        except Exception as e:  # noqa: BLE001 — a failed keepalive must never crash
+            self.errors += 1
+            if os.environ.get("PERMAFROST_VERBOSE") == "1":
+                sys.stderr.write(f"permafrost: keepalive failed: {e}\n")
+            return None
+        if usage:
+            with self.lock:
+                self.fires += 1
+                self.hit += usage["hit"]
+                self.miss += usage["miss"]
+        return usage
+
+    @staticmethod
+    def _http_send(body: dict, headers: dict[str, str]) -> dict | None:
+        data = pa.canonical_dumps(body)
+        h = dict(headers)
+        h["content-type"] = "application/json"
+        req = urllib.request.Request(UPSTREAM + "/v1/messages", data=data,
+                                     headers=h, method="POST")
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            text = resp.read().decode("utf-8", "replace")
+        return _sniff_usage(text)  # handles both plain JSON and SSE bodies
+
+    def loop(self) -> None:
+        tick = max(0.5, min(30.0, self.interval_s / 4)) if self.interval_s > 0 else 30.0
+        while True:
+            time.sleep(tick)
+            if self.should_fire(time.time()):
+                self.fire()
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            prices = _prices()
+            return {
+                "enabled": self.interval_s > 0,
+                "interval_s": self.interval_s,
+                "fires": self.fires,
+                "errors": self.errors,
+                "hit_tokens": self.hit,
+                "miss_tokens": self.miss,
+                "cost_usd": round(pa.cost_usd(self.hit, self.miss, self.fires, prices), 6),
+                "idle_s": round(time.time() - self.last_real, 1) if self.last_real else None,
+            }
+
+
+KEEPALIVE = Keepalive(KEEPALIVE_S, KEEPALIVE_IDLE_STOP_S)
+
 
 class Stats:
     """Thread-safe session + rolling cache accounting."""
@@ -224,31 +351,50 @@ class Stats:
         self.miss = 0
         self.output = 0
         self.last_report: dict | None = None
-        self.prev_anchor: str | None = None
+        # Churn is tracked per LINEAGE (stable system+tools ancestry): an anchor
+        # change within one lineage is a real cache bust; switching between
+        # request types (preflight vs agent loop) is not.
+        self.lineages: dict[str, dict] = {}
         self.prefix_changes: list[dict] = []
+        # Usage is also bucketed per SESSION (CC's metadata session id) so
+        # multiple sessions through one proxy stay readable.
+        self.sessions: dict[str, dict] = {}
         self.recent: list[dict] = []
 
-    def record_request(self, report: pa.AlignReport) -> None:
+    def record_request(self, report: pa.AlignReport, session: str | None) -> None:
         with self.lock:
             self.requests += 1
             self.last_report = report.as_dict()
             anchor = report.anchor_fingerprint
-            if self.prev_anchor is not None and anchor != self.prev_anchor:
+            lin = self.lineages.setdefault(report.lineage, {
+                "prev_anchor": None, "transitions": 0, "requests": 0})
+            lin["requests"] += 1
+            if lin["prev_anchor"] is not None and anchor != lin["prev_anchor"]:
+                lin["transitions"] += 1
                 self.prefix_changes.append({
-                    "from": self.prev_anchor,
+                    "lineage": report.lineage,
+                    "from": lin["prev_anchor"],
                     "to": anchor,
                     "request": self.requests,
                     "volatile_found": report.volatile_found,
-                    "blocks_relocated": report.blocks_relocated,
                 })
                 self.prefix_changes = self.prefix_changes[-20:]
-            self.prev_anchor = anchor
+            lin["prev_anchor"] = anchor
+            s = self.sessions.setdefault(session or "(none)", {
+                "requests": 0, "hit": 0, "miss": 0, "output": 0})
+            s["requests"] += 1
+            s["last_seen"] = round(time.time() - self.started, 1)
 
-    def record_usage(self, u: dict[str, int]) -> None:
+    def record_usage(self, u: dict[str, int], session: str | None = None) -> None:
         with self.lock:
             self.hit += u["hit"]
             self.miss += u["miss"]
             self.output += u["output"]
+            if session and session in self.sessions:
+                s = self.sessions[session]
+                s["hit"] += u["hit"]
+                s["miss"] += u["miss"]
+                s["output"] += u["output"]
             self.recent.append({"hit": u["hit"], "miss": u["miss"], "output": u["output"]})
             self.recent = self.recent[-50:]
 
@@ -271,6 +417,11 @@ class Stats:
                 "saved_usd": round(baseline - cost, 6),
                 "saved_pct": round((1 - cost / baseline) * 100, 1) if baseline else 0.0,
                 "prefix_changes": len(self.prefix_changes),
+                "sessions": {
+                    k: dict(v, hit_rate=round(pa.hit_rate(v["hit"], v["miss"]), 3))
+                    for k, v in self.sessions.items()
+                },
+                "lineages": {k: dict(v) for k, v in self.lineages.items()},
             }
 
 
@@ -346,6 +497,7 @@ class Handler(BaseHTTPRequestHandler):
         if clean == "/permafrost/stats":
             snap = STATS.snapshot()
             snap["coalesce"] = COALESCER.snapshot()
+            snap["keepalive"] = KEEPALIVE.snapshot()
             return self._json(200, snap)
         if clean == "/permafrost/doctor":
             with STATS.lock:
@@ -372,10 +524,12 @@ class Handler(BaseHTTPRequestHandler):
                 f"Volatile tokens in the system prefix ({vf}); run in aggressive "
                 "mode (PERMAFROST_MODE=aggressive) to relocate them."
             )
-        if STATS.prefix_changes:
+        churned = {k: v["transitions"] for k, v in STATS.lineages.items() if v["transitions"]}
+        if churned:
             advice.append(
-                f"The cache anchor changed {len(STATS.prefix_changes)}x this session. "
-                "Each change forces DeepSeek to re-read the whole prefix at full price."
+                f"The cache anchor changed within {len(churned)} request lineage(s): "
+                f"{churned}. A change *within* a lineage is a real cache bust — "
+                "every cached prefix token re-reads at full price."
             )
         c = COALESCER.snapshot()
         if c["enabled"] and c["followers_held"]:
@@ -395,14 +549,26 @@ class Handler(BaseHTTPRequestHandler):
             length = 0
         raw = self.rfile.read(length) if length else b""
 
+        clean_path = urllib.parse.urlsplit(self.path).path
+        if clean_path == "/permafrost/warm":
+            usage = KEEPALIVE.fire()
+            if usage is None:
+                return self._json(409, {"warmed": False,
+                                        "reason": "no request seen yet this proxy lifetime; "
+                                                  "use `permafrost warm` (disk replay)"})
+            return self._json(200, {"warmed": True, "usage": usage})
+
         out_bytes = raw
         report = None
+        session = None
         if _is_messages_path(self.path) and raw:
             try:
                 body = json.loads(raw)
+                session = pa.extract_session(body)
                 body, report = pa.align_request(body, MODE, store=FREEZE_STORE)
                 out_bytes = pa.canonical_dumps(body)
-                STATS.record_request(report)
+                STATS.record_request(report, session)
+                KEEPALIVE.note_request(body, dict(self.headers), report.anchor_fingerprint)
                 if DUMP_DIR:
                     self._dump_anchor(body, report)
             except (ValueError, TypeError) as e:
@@ -415,16 +581,16 @@ class Handler(BaseHTTPRequestHandler):
         role, gate = COALESCER.begin(fp)
         if role == "follower":
             COALESCER.wait_follower(gate)
-            self._forward("POST", out_bytes, report)
+            self._forward("POST", out_bytes, report, session=session)
         elif role == "leader":
-            status = self._forward("POST", out_bytes, report,
+            status = self._forward("POST", out_bytes, report, session=session,
                                    first_byte_cb=lambda: COALESCER.release(gate))
             if status is not None and status < 400:
                 COALESCER.warm(fp, gate)
             else:
                 COALESCER.fail(fp, gate)  # no usable cache write; let next retry
         else:  # pass / disabled
-            self._forward("POST", out_bytes, report)
+            self._forward("POST", out_bytes, report, session=session)
 
     def _dump_anchor(self, body: dict, report) -> None:
         """Debug: persist each request's cache anchor (tools + system) so a diff
@@ -452,7 +618,7 @@ class Handler(BaseHTTPRequestHandler):
         return headers
 
     def _forward(self, method: str, out_bytes: bytes | None, report,
-                 first_byte_cb=None) -> int | None:
+                 session: str | None = None, first_byte_cb=None) -> int | None:
         # self.path already carries /v1/... plus any query string; UPSTREAM ends
         # at /anthropic, so the full URL is <upstream>/v1/messages[?query].
         # Returns the upstream HTTP status, or None if the upstream was
@@ -514,7 +680,7 @@ class Handler(BaseHTTPRequestHandler):
             u_tail = _sniff_usage(bytes(tail).decode("utf-8", "replace"))
             u = _merge_usage(u_head, u_tail)
             if u:
-                STATS.record_usage(u)
+                STATS.record_usage(u, session)
         return status
 
     def _write_chunk(self, data: bytes) -> None:
@@ -540,6 +706,10 @@ def main() -> None:
     if MODE not in ("off", "safe", "aggressive"):
         sys.stderr.write(f"permafrost: unknown PERMAFROST_MODE={MODE!r}; using aggressive\n")
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
+    if KEEPALIVE.interval_s > 0:
+        threading.Thread(target=KEEPALIVE.loop, daemon=True).start()
+        sys.stderr.write(f"  keepalive   every {KEEPALIVE.interval_s:.0f}s while idle "
+                         f"(stops after {KEEPALIVE.idle_stop_s:.0f}s without real traffic)\n")
     banner = (
         f"\n  permafrost {Handler.server_version.split('/')[1]}  mode={MODE}\n"
         f"  listening   http://{HOST}:{PORT}\n"

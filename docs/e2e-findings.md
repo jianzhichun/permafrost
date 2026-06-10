@@ -69,6 +69,41 @@ so it cost zero per turn — exactly the intended steady state. Freeze's larger 
 is long sessions where `git status` changes between turns; there it sends only
 the changed lines instead of the whole block.
 
+## Finding 4 — cache identity includes the client's header fingerprint
+
+Discovered while building keepalive, through a chain of live probes:
+
+1. Replaying a real CC request **byte-identically** 8s later, but carrying only
+   the auth headers → **0% hit**.
+2. Replaying that replay (same reduced headers) → **99.8% hit**.
+3. Replaying a real CC request byte-identically **with CC's full header set**
+   (user-agent, accept, x-stainless-\*, …) → **99.9% hit (20,864/20,880)**.
+
+So two requests only share DeepSeek cache identity when both the rendered
+request *and the client header fingerprint* match. Consequences: Permafrost's
+keepalive replays the last request **unchanged in body and headers**; and any
+sidecar tooling that talks to the same endpoint with different headers (scripts,
+SDKs) will never warm or reuse the agent's cache.
+
+Along the way we also falsified two cheaper designs, on the live API:
+
+- **Anchor-only pre-warm** (tools+system + placeholder message): 0% hit — the
+  warm request's prefix is shorter than any persisted cache unit, and DeepSeek
+  only hits when the request "fully matches a cache prefix unit". Cross-session
+  disk pre-warm was therefore removed.
+- **Parameter-modified replay** (`max_tokens: 1`, `stream: false` to save output
+  cost): 0% hit against the original. The replay must be unchanged; the price of
+  a keepalive is one regenerated reply at hit-price input — still ~50× cheaper
+  than letting the prefix go cold.
+
+## Finding 5 — per-session and per-lineage accounting on real traffic
+
+Two sequential CC sessions through one proxy: per-session buckets read cleanly
+(session 1 cold: 50% hit; session 2: 66%), and lineage-bucketed churn detection
+reported **zero false anchor resets** — the preflight call (no tools) and the
+agent loop are separate lineages, so their alternation no longer pollutes the
+churn signal. Within both lineages, transitions = 0 across all 7 requests.
+
 ## Honest ceiling
 
 66% on a 4-turn task is near the practical maximum: the preflight and the first

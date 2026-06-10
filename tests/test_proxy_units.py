@@ -6,6 +6,7 @@ Importing permafrost_proxy is safe: the server only starts inside main().
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import threading
@@ -134,6 +135,77 @@ def test_coalesce_disabled_passes_through() -> None:
 def test_coalesce_no_fingerprint_passes() -> None:
     c = pp.Coalescer(enabled=True)
     assert c.begin(None) == ("pass", None)
+
+
+def test_extract_session_parses_cc_metadata() -> None:
+    body = {"metadata": {"user_id": json.dumps({
+        "device_id": "d" * 64, "account_uuid": "",
+        "session_id": "950eb7a5-ccd9-4625-a144-d5c625ad7b42"})}}
+    assert pa.extract_session(body) == "950eb7a5-ccd9-4625-a144-d5c625ad7b42"
+    assert pa.extract_session({"metadata": {"user_id": "plain-string"}}) is not None
+    assert pa.extract_session({}) is None
+
+
+def test_lineage_separates_request_types_not_env() -> None:
+    def req(tools, env_git):
+        return {"system": [
+            {"type": "text", "text": "Stable instructions."},
+            {"type": "text", "text": f"<env>\ngitStatus: {env_git}\n</env>"}],
+            "tools": tools}
+    t = [{"name": "Read"}]
+    # same request type, env changed -> SAME lineage
+    assert pa.lineage_key(req(t, "clean")) == pa.lineage_key(req(t, "M a.py"))
+    # different request type (no tools, e.g. preflight) -> different lineage
+    assert pa.lineage_key(req(t, "clean")) != pa.lineage_key(req([], "clean"))
+
+
+def test_stats_no_false_churn_across_interleaved_lineages() -> None:
+    s = pp.Stats()
+    rep_a1 = pa.AlignReport(lineage="lina", anchor_fingerprint="a1")
+    rep_b1 = pa.AlignReport(lineage="linb", anchor_fingerprint="b1")
+    # interleave two request types with stable anchors: A B A B
+    for r in (rep_a1, rep_b1, rep_a1, rep_b1):
+        s.record_request(r, session="s1")
+    assert len(s.prefix_changes) == 0, "interleaving lineages must not count as churn"
+    # a real within-lineage anchor change IS churn
+    s.record_request(pa.AlignReport(lineage="lina", anchor_fingerprint="a2"), session="s1")
+    assert len(s.prefix_changes) == 1
+
+
+def test_stats_buckets_usage_per_session() -> None:
+    s = pp.Stats()
+    s.record_request(pa.AlignReport(lineage="l", anchor_fingerprint="a"), session="s1")
+    s.record_usage({"hit": 100, "miss": 10, "output": 5}, session="s1")
+    s.record_request(pa.AlignReport(lineage="l", anchor_fingerprint="a"), session="s2")
+    s.record_usage({"hit": 50, "miss": 50, "output": 2}, session="s2")
+    snap = s.snapshot()
+    assert snap["sessions"]["s1"]["hit"] == 100 and snap["sessions"]["s2"]["miss"] == 50
+    assert snap["cache_hit_tokens"] == 150  # global totals still aggregate
+
+
+def test_keepalive_state_machine() -> None:
+    sent: list[dict] = []
+
+    def fake_sender(body, headers):
+        sent.append(body)
+        return {"input": 1000, "hit": 990, "miss": 10, "output": 1}
+
+    ka = pp.Keepalive(interval_s=10, idle_stop_s=100, sender=fake_sender)
+    assert not ka.should_fire(now=1000)            # nothing recorded yet
+    ka.note_request({"model": "m", "messages": [1]}, {"x-api-key": "k"}, "anch")
+    ka.last_real, ka.last_fire = 1000.0, 0.0       # deterministic clock
+    assert not ka.should_fire(1005)                # not idle long enough
+    assert ka.should_fire(1015)                    # idle one interval -> fire
+    assert not ka.should_fire(1150)                # past idle_stop -> abandoned
+    ka.last_fire = 1015.0                          # as if we just fired
+    assert not ka.should_fire(1020)                # within an interval of the fire
+    assert ka.should_fire(1026)                    # a full interval later again
+    u = ka.fire()
+    assert u and u["hit"] == 990 and ka.fires == 1
+    # The replay must be UNCHANGED: a replay differing in stream/max_tokens
+    # measurably misses the original's cache on DeepSeek (params are part of
+    # cache identity).
+    assert sent[0] == {"model": "m", "messages": [1]}
 
 
 def _run_all() -> int:

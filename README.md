@@ -142,6 +142,26 @@ concurrent same-anchor bursts wait, with a timeout guard against a stuck leader.
 is latency: followers wait for the leader's first byte (plus an optional
 `PERMAFROST_COALESCE_SETTLE_MS` for DeepSeek's async write to land).
 
+### Idle keepalive (opt-in)
+
+DeepSeek evicts cache entries that go unused, so a long think-time gap can leave
+your next turn paying full miss price on the whole conversation prefix. With
+`PERMAFROST_KEEPALIVE_S=<seconds>` set, the proxy replays the last request —
+**unchanged, body and headers** — after that much idle time, re-reading the
+whole prefix at hit price (~2% of a miss). Off by default because it fires real
+billable requests autonomously. `permafrost warm` triggers the same replay
+manually. Live-validated at **99.9% hit** on a real CC request replay; the
+"unchanged, headers too" part is load-bearing — DeepSeek's cache identity
+includes the client's header fingerprint, and replays that differ in params or
+headers measurably miss (see [`docs/e2e-findings.md`](docs/e2e-findings.md)).
+
+### Per-session & per-lineage stats
+
+`/permafrost/stats` buckets usage by Claude Code session id, and tracks anchor
+churn per *lineage* (stable system+tools ancestry) — so CC's tool-less preflight
+calls don't pollute the churn signal, and multiple sessions through one proxy
+stay readable.
+
 Full mechanism: [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md).
 The complete catalogue of Claude Code cache-busters it defends against —
 including the "random header" worry: [`docs/cache-busters.md`](docs/cache-busters.md).
@@ -192,6 +212,8 @@ Full survey: [`docs/landscape.md`](docs/landscape.md).
 | `PERMAFROST_COALESCE` | `1` | hold parallel cold-anchor requests until the first warms the cache (`0` disables) |
 | `PERMAFROST_COALESCE_TIMEOUT_S` | `30` | follower deadlock guard |
 | `PERMAFROST_COALESCE_SETTLE_MS` | `0` | extra wait after release, to let DeepSeek's async cache settle |
+| `PERMAFROST_KEEPALIVE_S` | `0` (off) | opt-in: replay the last request unchanged after this much idle, keeping the prefix warm at hit price |
+| `PERMAFROST_KEEPALIVE_IDLE_STOP_S` | `7200` | stop keepalives after this much idle (abandoned-session guard) |
 | `PERMAFROST_PRICES` | V4 Flash | `"hit,miss,output"` USD/1M for the cost readout |
 
 > The benchmark emulator measures byte-prefix overlap; DeepSeek matches a

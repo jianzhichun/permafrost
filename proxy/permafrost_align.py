@@ -94,6 +94,7 @@ class AlignReport:
     relocated_chars: int = 0
     env_frozen: bool = False
     env_delta_lines: int = 0
+    lineage: str = ""
     anchor_fingerprint: str = ""
     anchor_bytes: int = 0
     notes: list[str] = field(default_factory=list)
@@ -110,6 +111,7 @@ class AlignReport:
             "relocated_chars": self.relocated_chars,
             "env_frozen": self.env_frozen,
             "env_delta_lines": self.env_delta_lines,
+            "lineage": self.lineage,
             "anchor_fingerprint": self.anchor_fingerprint,
             "anchor_bytes": self.anchor_bytes,
             "notes": self.notes,
@@ -349,17 +351,44 @@ class FreezeStore:
             return self.snap[key]
 
 
-def _session_key(body: dict[str, Any], env_idx: int) -> str:
-    """Fingerprint the stable part of the prefix (system minus the env block, plus
-    tools) — the same across a session, so it groups a conversation's turns."""
+def lineage_key(body: dict[str, Any]) -> str:
+    """Fingerprint the *stable* part of the prefix: system minus env-like blocks,
+    plus tools. Requests in the same lineage share a cache-anchor ancestry —
+    every turn of one conversation, and even separate sessions on the same
+    project. Different request types (a tool-less preflight vs. the agent loop)
+    get different lineages, so churn diagnostics bucket per lineage instead of
+    flagging legitimate type switches as cache busts."""
     system = body.get("system")
     stable: Any
     if isinstance(system, list):
-        stable = [b for i, b in enumerate(system) if i != env_idx]
+        stable = [
+            b for b in system
+            if not (isinstance(b, dict) and _looks_like_env_block(b.get("text", "")))
+        ]
     else:
         stable = system
     payload = canonical_dumps({"system": stable, "tools": body.get("tools")})
     return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def extract_session(body: dict[str, Any]) -> str | None:
+    """Pull a stable session id out of Claude Code's request metadata.
+
+    CC sends metadata.user_id as a JSON-encoded string containing device_id and
+    session_id; fall back to the raw user_id string for other clients."""
+    md = body.get("metadata")
+    if not isinstance(md, dict):
+        return None
+    uid = md.get("user_id")
+    if not isinstance(uid, str) or not uid:
+        return None
+    try:
+        inner = json.loads(uid)
+        if isinstance(inner, dict) and inner.get("session_id"):
+            return str(inner["session_id"])[:36]
+    except (ValueError, TypeError):
+        pass
+    return hashlib.sha256(uid.encode()).hexdigest()[:12]
 
 
 def freeze_volatile(body: dict[str, Any], report: AlignReport, store: "FreezeStore") -> None:
@@ -387,7 +416,7 @@ def freeze_volatile(body: dict[str, Any], report: AlignReport, store: "FreezeSto
 
     idx = env_ids[0]
     cur_text = system[idx].get("text", "")
-    key = _session_key(body, idx)
+    key = lineage_key(body)
     frozen = store.freeze(key, cur_text)
 
     # Pin the anchor to the frozen snapshot (byte-stable across the session).
@@ -453,6 +482,7 @@ def align_request(body: dict[str, Any], mode: str = "aggressive",
     if mode == "off":
         fp, n = anchor_fingerprint(body)
         report.anchor_fingerprint, report.anchor_bytes = fp, n
+        report.lineage = lineage_key(body)
         report.tools_count = len(body.get("tools") or [])
         report.volatile_found = detect_volatile(body)
         return body, report
@@ -471,6 +501,7 @@ def align_request(body: dict[str, Any], mode: str = "aggressive",
 
     fp, n = anchor_fingerprint(body)
     report.anchor_fingerprint, report.anchor_bytes = fp, n
+    report.lineage = lineage_key(body)
     return body, report
 
 

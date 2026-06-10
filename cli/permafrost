@@ -7,6 +7,8 @@ Subcommands:
   status                      print live cache stats (hit rate, $ saved)
   doctor                      print the alignment report + what's busting the cache
   wrap [-- claude args...]    ensure the proxy is up, then exec `claude` pointed at it
+  warm                        re-warm the cache by replaying the proxy's last-seen
+                              request unchanged (same conversation only)
   bench [--turns N] [--real]  run the cache benchmark
 
 `wrap` sets ANTHROPIC_BASE_URL / ENABLE_TOOL_SEARCH only for the child `claude`
@@ -22,6 +24,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -146,6 +149,26 @@ def cmd_wrap(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_warm(_args: argparse.Namespace) -> int:
+    """Replay the proxy's last-seen request unchanged to re-warm its cache.
+
+    Same-conversation only: an anchor-only or modified replay measurably misses
+    DeepSeek's cache (params and full prefix are part of cache identity), so
+    there is deliberately no cross-session disk fallback."""
+    if not _running():
+        print("permafrost not reachable; run `permafrost up` first")
+        return 1
+    try:
+        req = urllib.request.Request(_base() + "/permafrost/warm", data=b"", method="POST")
+        with urllib.request.urlopen(req, timeout=300) as r:
+            out = json.loads(r.read())
+        print(f"warmed: usage={out.get('usage')}")
+        return 0
+    except urllib.error.HTTPError as e:
+        print(f"warm failed ({e.code}): {e.read().decode(errors='replace')[:200]}")
+        return 1
+
+
 def cmd_bench(args: argparse.Namespace) -> int:
     cmd = [sys.executable, BENCH, "--turns", str(args.turns)]
     if args.real:
@@ -167,6 +190,7 @@ def main() -> int:
     sub.add_parser("doctor").set_defaults(fn=cmd_doctor)
     p = sub.add_parser("wrap"); p.add_argument("claude_args", nargs=argparse.REMAINDER)
     p.set_defaults(fn=cmd_wrap)
+    sub.add_parser("warm").set_defaults(fn=cmd_warm)
     p = sub.add_parser("bench"); p.add_argument("--turns", type=int, default=12)
     p.add_argument("--real", action="store_true"); p.add_argument("--write")
     p.set_defaults(fn=cmd_bench)

@@ -22,5 +22,7 @@ jobs:
         run: bash tests/proxy_smoke.sh
       - name: coalescing concurrency test (isolated)
         run: bash tests/coalesce_smoke.sh
+      - name: keepalive test (isolated)
+        run: bash tests/keepalive_smoke.sh
       - name: benchmark (emulator)
         run: python3 benchmarks/bench.py --turns 12
