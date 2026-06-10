@@ -22,8 +22,10 @@ echo "starting mock upstream on :$MOCK_PORT"
 MOCK_RECORD="$REC" "$PY" "$ROOT/tests/mock_upstream.py" "$MOCK_PORT" &
 MOCK_PID=$!
 
-echo "starting proxy on :$PROXY_PORT (mode=aggressive, upstream=mock)"
-PERMAFROST_PORT="$PROXY_PORT" PERMAFROST_MODE=aggressive \
+echo "starting proxy on :$PROXY_PORT (mode=aggressive, relocate path, upstream=mock)"
+# FREEZE_ENV=0 exercises the stateless relocate path this smoke asserts on;
+# freeze+delta is covered by tests/test_alignment.py and the real-CC e2e.
+PERMAFROST_PORT="$PROXY_PORT" PERMAFROST_MODE=aggressive PERMAFROST_FREEZE_ENV=0 \
   PERMAFROST_UPSTREAM="http://127.0.0.1:$MOCK_PORT" \
   "$PY" "$ROOT/proxy/permafrost_proxy.py" &
 PROXY_PID=$!

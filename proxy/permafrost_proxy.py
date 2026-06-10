@@ -20,6 +20,8 @@ Env:
   PERMAFROST_HOST       (default 127.0.0.1)
   PERMAFROST_UPSTREAM   (default https://api.deepseek.com/anthropic)
   PERMAFROST_MODE       off | safe | aggressive   (default aggressive)
+  PERMAFROST_FREEZE_ENV 1 to freeze the env block into the cached anchor and emit
+                        only changed lines on the tail (default 1); 0 relocates
   PERMAFROST_NORMALIZE_BETA  1 to sort+dedup the anthropic-beta header (default 1)
   PERMAFROST_COALESCE   1 to hold parallel cold-anchor requests until the first
                         one warms the cache (default 1); 0 disables
@@ -53,6 +55,8 @@ PORT = int(os.environ.get("PERMAFROST_PORT", "8787"))
 UPSTREAM = os.environ.get("PERMAFROST_UPSTREAM", "https://api.deepseek.com/anthropic").rstrip("/")
 MODE = os.environ.get("PERMAFROST_MODE", "aggressive")
 NORMALIZE_BETA = os.environ.get("PERMAFROST_NORMALIZE_BETA", "1") == "1"
+FREEZE_ENV = os.environ.get("PERMAFROST_FREEZE_ENV", "1") == "1"
+FREEZE_STORE = pa.FreezeStore() if FREEZE_ENV else None
 
 _HOP_BY_HOP = {
     "host", "content-length", "connection", "keep-alive", "proxy-authenticate",
@@ -393,7 +397,7 @@ class Handler(BaseHTTPRequestHandler):
         if _is_messages_path(self.path) and raw:
             try:
                 body = json.loads(raw)
-                body, report = pa.align_request(body, MODE)
+                body, report = pa.align_request(body, MODE, store=FREEZE_STORE)
                 out_bytes = pa.canonical_dumps(body)
                 STATS.record_request(report)
             except (ValueError, TypeError) as e:

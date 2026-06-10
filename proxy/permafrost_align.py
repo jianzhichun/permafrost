@@ -40,6 +40,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -90,6 +91,8 @@ class AlignReport:
     volatile_found: dict[str, int] = field(default_factory=dict)
     blocks_relocated: int = 0
     relocated_chars: int = 0
+    env_frozen: bool = False
+    env_delta_lines: int = 0
     anchor_fingerprint: str = ""
     anchor_bytes: int = 0
     notes: list[str] = field(default_factory=list)
@@ -103,6 +106,8 @@ class AlignReport:
             "volatile_found": self.volatile_found,
             "blocks_relocated": self.blocks_relocated,
             "relocated_chars": self.relocated_chars,
+            "env_frozen": self.env_frozen,
+            "env_delta_lines": self.env_delta_lines,
             "anchor_fingerprint": self.anchor_fingerprint,
             "anchor_bytes": self.anchor_bytes,
             "notes": self.notes,
@@ -270,6 +275,107 @@ def relocate_volatile(body: dict[str, Any], report: AlignReport) -> None:
     messages[-1] = last
 
 
+def _append_context_block(body: dict[str, Any], text: str) -> bool:
+    """Append a text block to the tail of the most recent message. Returns True
+    on success (there was a message to attach to)."""
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return False
+    last = messages[-1]
+    last["content"] = _coerce_blocks(last.get("content")) + [{"type": "text", "text": text}]
+    messages[-1] = last
+    return True
+
+
+class FreezeStore:
+    """Per-session frozen env snapshots for freeze+delta (thread-safe, LRU).
+
+    Keyed on a session fingerprint (the stable, non-env part of the prefix), it
+    remembers the first env block it saw so later turns can pin the anchor to
+    that snapshot and emit only what changed.
+    """
+
+    def __init__(self, cap: int = 512) -> None:
+        self.lock = threading.Lock()
+        self.snap: dict[str, str] = {}
+        self.order: list[str] = []
+        self.cap = cap
+
+    def freeze(self, key: str, current_text: str) -> str:
+        """Return the frozen snapshot for `key`, setting it to `current_text`
+        the first time the key is seen."""
+        with self.lock:
+            if key not in self.snap:
+                self.snap[key] = current_text
+                self.order.append(key)
+                while len(self.order) > self.cap:
+                    self.snap.pop(self.order.pop(0), None)
+            else:
+                self.order.remove(key)
+                self.order.append(key)
+            return self.snap[key]
+
+
+def _session_key(body: dict[str, Any], env_idx: int) -> str:
+    """Fingerprint the stable part of the prefix (system minus the env block, plus
+    tools) — the same across a session, so it groups a conversation's turns."""
+    system = body.get("system")
+    stable: Any
+    if isinstance(system, list):
+        stable = [b for i, b in enumerate(system) if i != env_idx]
+    else:
+        stable = system
+    payload = canonical_dumps({"system": stable, "tools": body.get("tools")})
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def freeze_volatile(body: dict[str, Any], report: AlignReport, store: "FreezeStore") -> None:
+    """Freeze the env block into the anchor; emit only changed lines on the tail.
+
+    The stateful upgrade to `relocate_volatile`: instead of re-sending the whole
+    env block off the prefix every turn, we pin the first-seen env snapshot into
+    `system` (so it's cached for the rest of the session) and inject just the
+    lines that differ from it on the latest turn. An unchanged env costs zero
+    tokens per turn; a changed one costs only its delta. Falls back to
+    relocation when the request doesn't have exactly one env block.
+    """
+    system = body.get("system")
+    if not isinstance(system, list):
+        relocate_volatile(body, report)
+        return
+
+    env_ids = [
+        i for i, b in enumerate(system)
+        if isinstance(b, dict) and _count_volatile(b.get("text", "")) and _looks_like_env_block(b.get("text", ""))
+    ]
+    if len(env_ids) != 1:
+        relocate_volatile(body, report)  # 0 or many env blocks: stateless fallback
+        return
+
+    idx = env_ids[0]
+    cur_text = system[idx].get("text", "")
+    key = _session_key(body, idx)
+    frozen = store.freeze(key, cur_text)
+
+    # Pin the anchor to the frozen snapshot (byte-stable across the session).
+    if frozen != cur_text:
+        block = dict(system[idx])
+        block["text"] = frozen
+        system[idx] = block
+    report.env_frozen = True
+
+    # Emit only the lines that changed since the snapshot, as a superseding note.
+    frozen_lines = set(frozen.splitlines())
+    delta = [ln for ln in cur_text.splitlines() if ln.strip() and ln not in frozen_lines]
+    if delta:
+        note = ("<env-update>\nThese environment values changed since the session "
+                "start; use them as current:\n" + "\n".join(delta) + "\n</env-update>")
+        if _append_context_block(body, note):
+            report.env_delta_lines = len(delta)
+        else:
+            report.notes.append("env changed but no turn to attach the delta to")
+
+
 def detect_volatile(body: dict[str, Any]) -> dict[str, int]:
     """Report volatile tokens sitting in the cache anchor (system blocks)."""
     found: dict[str, int] = {}
@@ -300,11 +406,14 @@ def anchor_fingerprint(body: dict[str, Any]) -> tuple[str, int]:
     return hashlib.sha256(anchor).hexdigest()[:12], len(anchor)
 
 
-def align_request(body: dict[str, Any], mode: str = "aggressive") -> tuple[dict[str, Any], AlignReport]:
+def align_request(body: dict[str, Any], mode: str = "aggressive",
+                  store: "FreezeStore | None" = None) -> tuple[dict[str, Any], AlignReport]:
     """Run the full pipeline. `mode` is "safe" or "aggressive"; "off" is a no-op.
 
-    Returns the (mutated) body and a report. The caller serializes with
-    `canonical_dumps` to get the bytes to forward upstream.
+    In aggressive mode, pass a `FreezeStore` to use freeze+delta (pin the env
+    snapshot into the cached anchor, emit only changes on the tail). Without a
+    store, aggressive mode falls back to stateless relocation. Returns the
+    (mutated) body and a report; serialize with `canonical_dumps` to forward.
     """
     report = AlignReport(mode=mode)
 
@@ -321,7 +430,10 @@ def align_request(body: dict[str, Any], mode: str = "aggressive") -> tuple[dict[
     report.tools_count = len(body.get("tools") or [])
 
     if mode == "aggressive":
-        relocate_volatile(body, report)
+        if store is not None:
+            freeze_volatile(body, report, store)
+        else:
+            relocate_volatile(body, report)
 
     fp, n = anchor_fingerprint(body)
     report.anchor_fingerprint, report.anchor_bytes = fp, n

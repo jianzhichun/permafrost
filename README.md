@@ -103,10 +103,13 @@ On every `/v1/messages` request, the alignment pipeline
    positions are pure prefix noise.
 2. **sorts tools** deterministically — so late-binding MCP servers can't reshuffle
    position 0 of the prefix.
-3. **relocates volatile content** (aggressive mode) — lifts the env/context block
-   (today's date, `git status`, UUIDs, hashes) out of the cached anchor and
-   re-attaches it to the latest turn. Same content, later position, no longer
-   resetting the cache every time you touch a file.
+3. **freezes the env block + emits deltas** (aggressive mode) — pins the
+   first-seen environment/context block (cwd, platform, today's date,
+   `git status`) into the cached anchor, then on later turns sends only the
+   *lines that changed* on the tail. An unchanged env costs zero tokens per turn;
+   a changed one costs only its delta — instead of re-sending the whole block
+   every turn. (Set `PERMAFROST_FREEZE_ENV=0` to fall back to relocating the
+   whole block off the prefix instead.)
 4. **serializes canonically** — compact, UTF-8-faithful, stable bytes.
 
 It then reads DeepSeek's `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
@@ -176,6 +179,7 @@ Full survey: [`docs/landscape.md`](docs/landscape.md).
 | `PERMAFROST_PORT` | `8787` | proxy listen port |
 | `PERMAFROST_UPSTREAM` | `https://api.deepseek.com/anthropic` | where to forward (any Anthropic-compatible endpoint works) |
 | `PERMAFROST_MODE` | `aggressive` | `off` / `safe` / `aggressive` |
+| `PERMAFROST_FREEZE_ENV` | `1` | freeze the env block into the anchor + emit only changed lines (`0` relocates the whole block) |
 | `PERMAFROST_NORMALIZE_BETA` | `1` | sort + dedup the `anthropic-beta` header (never adds/drops a flag) |
 | `PERMAFROST_COALESCE` | `1` | hold parallel cold-anchor requests until the first warms the cache (`0` disables) |
 | `PERMAFROST_COALESCE_TIMEOUT_S` | `30` | follower deadlock guard |

@@ -115,6 +115,62 @@ def test_serialized_prefix_grows_monotonically_aggressive() -> None:
         history.append({"role": "assistant", "content": [{"type": "text", "text": "ok"}]})
 
 
+def _req_env(turn: int, git: str, messages: list[dict]) -> dict:
+    return {
+        "model": "claude-sonnet-4-6",
+        "system": [
+            {"type": "text", "text": "Stable agent instructions. " * 50},
+            {"type": "text", "text": f"<env>\nWorking directory: /repo\nPlatform: linux\n"
+                                     f"Today's date: 2026-06-10\ngitStatus: {git}\n</env>"},
+        ],
+        "tools": [{"name": "Read", "description": "r", "input_schema": {"type": "object"}}],
+        "messages": messages,
+    }
+
+
+def test_freeze_pins_anchor_and_deltas_only_changes() -> None:
+    store = pa.FreezeStore()
+    h1 = [{"role": "user", "content": [{"type": "text", "text": "t1"}]}]
+    b1, r1 = pa.align_request(_req_env(0, "clean", h1), "aggressive", store=store)
+    assert r1.env_frozen
+    # turn 2: only gitStatus changed
+    h2 = [{"role": "user", "content": [{"type": "text", "text": "t1"}]},
+          {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+          {"role": "user", "content": [{"type": "text", "text": "t2"}]}]
+    b2, r2 = pa.align_request(_req_env(1, "M src/a.py", h2), "aggressive", store=store)
+    # the system anchor is byte-identical across the two turns (frozen snapshot)...
+    assert json.dumps(b1["system"]) == json.dumps(b2["system"])
+    assert r1.anchor_fingerprint == r2.anchor_fingerprint
+    # ...the frozen env (turn-1 'clean') stays in system, NOT turn-2's value...
+    assert "clean" in json.dumps(b2["system"]) and "M src/a.py" not in json.dumps(b2["system"])
+    # ...and only the changed line rides the tail as a delta.
+    assert r2.env_delta_lines == 1
+    assert "M src/a.py" in json.dumps(b2["messages"][-1])
+
+
+def test_freeze_unchanged_env_emits_no_delta() -> None:
+    store = pa.FreezeStore()
+    h = [{"role": "user", "content": [{"type": "text", "text": "t1"}]}]
+    pa.align_request(_req_env(0, "clean", h), "aggressive", store=store)
+    _, r2 = pa.align_request(_req_env(1, "clean", list(h)), "aggressive", store=store)
+    assert r2.env_delta_lines == 0  # nothing changed -> zero tokens on the tail
+
+
+def test_freeze_beats_relocate_on_stable_env_bytes() -> None:
+    """Over turns where the env doesn't change, freeze sends fewer tail bytes:
+    the env is cached in the anchor instead of re-sent every turn."""
+    store = pa.FreezeStore()
+    freeze_tail = relocate_tail = 0
+    for turn in range(5):
+        def fresh() -> list[dict]:  # independent dicts per call (no shared mutation)
+            return [{"role": "user", "content": [{"type": "text", "text": f"t{turn}"}]}]
+        bf, _ = pa.align_request(_req_env(turn, "clean", fresh()), "aggressive", store=store)
+        br, _ = pa.align_request(_req_env(turn, "clean", fresh()), "aggressive")  # relocate
+        freeze_tail += len(json.dumps(bf["messages"]))
+        relocate_tail += len(json.dumps(br["messages"]))
+    assert freeze_tail < relocate_tail, f"freeze {freeze_tail} not < relocate {relocate_tail}"
+
+
 def test_normalize_usage_both_shapes() -> None:
     ds = pa.normalize_usage({"prompt_tokens": 1000, "prompt_cache_hit_tokens": 800,
                              "prompt_cache_miss_tokens": 200, "completion_tokens": 50})

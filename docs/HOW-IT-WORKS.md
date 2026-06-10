@@ -37,7 +37,8 @@ Each request runs through `align_request(body, mode)`:
 |---|---|---|---|
 | Strip cache markers | `strip_cache_control` | safe, aggressive | Removes every `cache_control` key (DeepSeek ignores them; their positions drift) |
 | Sort tools | `sort_tools` | safe, aggressive | Deterministic `(name, canonical-json)` order, immune to MCP arrival timing |
-| Relocate volatile | `relocate_volatile` | aggressive | Moves env/context blocks (date, git status, UUIDs, hashes) out of the anchor onto the latest turn — same content, later position |
+| Freeze env + delta | `freeze_volatile` | aggressive (default) | Pins the first env snapshot into the cached anchor; emits only the lines that changed on the tail. Unchanged env = 0 tokens/turn |
+| Relocate volatile | `relocate_volatile` | aggressive (`FREEZE_ENV=0`) | Stateless fallback: moves the whole env block out of the anchor onto the latest turn |
 | Canonical serialize | `canonical_dumps` | all | Compact separators, `ensure_ascii=False`, stable byte output |
 
 `safe` mode does only the provably-lossless transforms (re-ordering and
