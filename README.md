@@ -98,9 +98,22 @@ child `claude` process only** — it never touches your shell or
 run `permafrost up`, then start `claude` normally. (Claude Code reads its env once
 at launch, so these must be set *before* `claude` starts.)
 
-**Install as a plugin** for the `/permafrost:*` commands and the statusline — add
-this repo to a marketplace or drop it under a skills dir; see
-[Claude Code plugin docs](https://code.claude.com/docs/en/plugins).
+### Install as a Claude Code plugin
+
+This repo is its own plugin marketplace — two commands inside Claude Code:
+
+```
+/plugin marketplace add jianzhichun/permafrost
+/plugin install permafrost@permafrost
+```
+
+(or from a shell: `claude plugin marketplace add jianzhichun/permafrost &&
+claude plugin install permafrost@permafrost`)
+
+That gives you the `/permafrost:*` commands, the SessionStart auto-start hook,
+and the statusline script. The proxy itself is part of the plugin — `permafrost
+wrap` / the settings block above point Claude Code at it. Update later with
+`/plugin marketplace update permafrost`.
 
 ## What it does, exactly
 

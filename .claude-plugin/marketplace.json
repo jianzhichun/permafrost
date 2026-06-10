@@ -1,0 +1,30 @@
+{
+  "name": "permafrost",
+  "owner": {
+    "name": "jianzhichun",
+    "url": "https://github.com/jianzhichun"
+  },
+  "metadata": {
+    "description": "Permafrost — make Claude Code's traffic hit DeepSeek's prefix cache: alignment proxy, coalescing, keepalive, live savings stats."
+  },
+  "plugins": [
+    {
+      "name": "permafrost",
+      "source": "./",
+      "description": "Freeze Claude Code's prompt prefix so DeepSeek's automatic cache always hits — cache-stable passthrough proxy, cold-anchor coalescing, idle keepalive, live hit-rate diagnostics.",
+      "author": {
+        "name": "jianzhichun",
+        "url": "https://github.com/jianzhichun"
+      },
+      "homepage": "https://github.com/jianzhichun/permafrost",
+      "license": "MIT",
+      "keywords": [
+        "deepseek",
+        "prompt-cache",
+        "prefix-cache",
+        "proxy",
+        "cost-optimization"
+      ]
+    }
+  ]
+}
