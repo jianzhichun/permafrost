@@ -62,8 +62,9 @@ canonical request shape. (See [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).)
 with *shuffled tool order and changing `git status` each time* — exactly the
 traffic that misses in `off` mode — were aligned to one frozen anchor
 (`prefix_resets=0`). Once the prefix was warm, DeepSeek served **~97%** of it
-from cache (`hit=4096`, fresh `miss=111`). The proxy held the anchor stable
-despite the naive-client churn.
+from cache (a single warm request: `hit=2048`, `miss=55` → **97%**). The proxy
+held the anchor stable despite the naive-client churn — including over the
+`/v1/messages?beta=true` query-string path.
 
 > "Anchor resets" = how many times the `tools+system` prefix changed bytes across
 > the run. Each reset forces DeepSeek to re-read the whole prefix at full price.
@@ -156,9 +157,14 @@ Full survey: [`docs/landscape.md`](docs/landscape.md).
 | `PERMAFROST_PORT` | `8787` | proxy listen port |
 | `PERMAFROST_UPSTREAM` | `https://api.deepseek.com/anthropic` | where to forward (any Anthropic-compatible endpoint works) |
 | `PERMAFROST_MODE` | `aggressive` | `off` / `safe` / `aggressive` |
-| `PERMAFROST_SORT_KEYS` | `0` | also sort JSON object keys (extra determinism) |
-| `PERMAFROST_STICKY_BETA` | `1` | pin the first-seen `anthropic-beta` per anchor |
+| `PERMAFROST_NORMALIZE_BETA` | `1` | sort + dedup the `anthropic-beta` header (never adds/drops a flag) |
 | `PERMAFROST_PRICES` | V4 Flash | `"hit,miss,output"` USD/1M for the cost readout |
+
+> The benchmark emulator measures byte-prefix overlap; DeepSeek matches a
+> *rendered-token* prefix. The two load-bearing transforms (tool sort, env
+> relocation) change the rendered prompt and are validated against the live API
+> above. `cache_control` stripping and canonical serialization are byte-level
+> insurance — harmless to DeepSeek, useful for byte-sensitive gateways.
 
 ## Tests
 

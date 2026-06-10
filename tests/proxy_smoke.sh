@@ -14,7 +14,7 @@ PY="${PYTHON:-python3}"
 cleanup() {
   [[ -n "${MOCK_PID:-}" ]] && kill "$MOCK_PID" 2>/dev/null || true
   [[ -n "${PROXY_PID:-}" ]] && kill "$PROXY_PID" 2>/dev/null || true
-  rm -f "$REC"
+  rm -f "$REC" "$REC.beta"
 }
 trap cleanup EXIT
 
@@ -37,11 +37,20 @@ done
 echo "--- health ---"
 curl -fsS "http://127.0.0.1:$PROXY_PORT/permafrost/health"; echo
 
-echo "--- POST /v1/messages (tools shuffled + volatile env) ---"
+echo "--- POST /v1/messages?beta=true (P0: query string must NOT bypass alignment) ---"
 REQ='{"model":"claude-sonnet-4-6","system":[{"type":"text","text":"Stable instructions here, long enough to matter and then some more text.","cache_control":{"type":"ephemeral"}},{"type":"text","text":"<env>\nToday'"'"'s date: 2026-06-10\ngitStatus: M a.py\n</env>"}],"tools":[{"name":"Zebra","description":"z","input_schema":{"type":"object"}},{"name":"Apple","description":"a","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}'
-curl -fsS -X POST "http://127.0.0.1:$PROXY_PORT/v1/messages" \
-  -H 'content-type: application/json' -H 'x-api-key: test' --data "$REQ" >/dev/null
+curl -fsS -X POST "http://127.0.0.1:$PROXY_PORT/v1/messages?beta=true" \
+  -H 'content-type: application/json' -H 'x-api-key: test' \
+  -H 'anthropic-beta: feat-b,feat-a,feat-b' --data "$REQ" >/dev/null
 echo "ok (streamed)"
+
+echo "--- GET /v1/models (must be forwarded, not 404'd) ---"
+curl -fsS "http://127.0.0.1:$PROXY_PORT/v1/models" | grep -q deepseek-v4-flash \
+  && echo "  GET passthrough works" || { echo "FAIL: GET not forwarded"; exit 1; }
+
+echo "--- anthropic-beta normalization (sort+dedup, no add/drop) ---"
+BETA="$(cat "$REC.beta" 2>/dev/null || true)"
+[[ "$BETA" == "feat-a,feat-b" ]] && echo "  beta normalized: '$BETA'" || { echo "FAIL: beta='$BETA' (expected feat-a,feat-b)"; exit 1; }
 
 echo "--- forwarded body assertions ---"
 "$PY" - "$REC" <<'PYEOF'

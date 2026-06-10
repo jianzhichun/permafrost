@@ -15,7 +15,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: unit tests (offline, no deps)
-        run: python3 tests/test_alignment.py
+        run: |
+          python3 tests/test_alignment.py
+          python3 tests/test_proxy_units.py
       - name: proxy smoke test (isolated, local mock upstream)
         run: bash tests/proxy_smoke.sh
       - name: benchmark (emulator)

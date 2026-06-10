@@ -345,28 +345,31 @@ def normalize_usage(usage: dict[str, Any]) -> dict[str, int]:
         return {"input": 0, "hit": 0, "miss": 0, "output": 0}
 
     hit = int(usage.get("prompt_cache_hit_tokens") or 0)
-    miss = int(usage.get("prompt_cache_miss_tokens") or 0)
-
-    # Anthropic shape
     if hit == 0:
         hit = int(usage.get("cache_read_input_tokens") or 0)
     details = usage.get("prompt_tokens_details")
     if hit == 0 and isinstance(details, dict):
         hit = int(details.get("cached_tokens") or 0)
 
-    prompt = int(usage.get("prompt_tokens") or 0)
-    inp = int(usage.get("input_tokens") or 0)
-    # Anthropic's `input_tokens` excludes cached/created; DeepSeek's
-    # `prompt_tokens` includes everything. Derive a consistent "miss".
+    # "miss" = input tokens NOT served from cache, i.e. billed at full price.
+    miss = int(usage.get("prompt_cache_miss_tokens") or 0)
     if miss == 0:
-        if prompt and hit and prompt > hit:
-            miss = prompt - hit
-        elif inp:
-            miss = inp  # Anthropic: input_tokens is the uncached remainder
+        inp = int(usage.get("input_tokens") or 0)
+        created = int(usage.get("cache_creation_input_tokens") or 0)
+        if inp or created:
+            # Anthropic shape: input_tokens is the uncached remainder and
+            # cache_creation is what we wrote to cache this turn — the write
+            # costs full price plus a premium, so both count as misses here.
+            miss = inp + created
+        else:
+            prompt = int(usage.get("prompt_tokens") or 0)
+            if prompt and hit and prompt > hit:
+                miss = prompt - hit  # DeepSeek: prompt_tokens includes the hit
+            elif prompt:
+                miss = prompt
 
     output = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
-    total_input = hit + miss if (hit or miss) else (prompt or inp)
-    return {"input": total_input, "hit": hit, "miss": miss, "output": output}
+    return {"input": hit + miss, "hit": hit, "miss": miss, "output": output}
 
 
 def hit_rate(hit: int, miss: int) -> float:

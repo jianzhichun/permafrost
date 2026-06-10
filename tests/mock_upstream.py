@@ -36,9 +36,23 @@ class H(BaseHTTPRequestHandler):
         if RECORD:
             with open(RECORD, "wb") as f:
                 f.write(body)
+        # Record the anthropic-beta header too, so a test can assert normalization.
+        if RECORD:
+            with open(RECORD + ".beta", "w") as f:
+                f.write(self.headers.get("anthropic-beta", ""))
         payload = SSE.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):
+        # Stand in for a real GET endpoint (e.g. /v1/models) so the proxy's
+        # GET-passthrough path can be exercised.
+        payload = b'{"data":[{"id":"deepseek-v4-flash"}]}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
