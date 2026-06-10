@@ -23,6 +23,7 @@ MOCK_PID=$!
 
 echo "starting proxy on :$PROXY_PORT (coalescing on)"
 PERMAFROST_PORT="$PROXY_PORT" PERMAFROST_MODE=aggressive PERMAFROST_COALESCE=1 \
+  PERMAFROST_COALESCE_SETTLE_MS=0 \
   PERMAFROST_UPSTREAM="http://127.0.0.1:$MOCK_PORT" \
   "$PY" "$ROOT/proxy/permafrost_proxy.py" &
 PROXY_PID=$!

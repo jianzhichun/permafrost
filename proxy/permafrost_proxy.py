@@ -26,7 +26,11 @@ Env:
   PERMAFROST_COALESCE   1 to hold parallel cold-anchor requests until the first
                         one warms the cache (default 1); 0 disables
   PERMAFROST_COALESCE_TIMEOUT_S  follower deadlock guard (default 30)
-  PERMAFROST_COALESCE_SETTLE_MS  extra wait after release for async cache (default 0)
+  PERMAFROST_COALESCE_SETTLE_MS  extra wait after release for the async cache
+                        write to land (default 2500; live probes show ~6s to settle)
+  PERMAFROST_COALESCE_RELEASE  first_byte (default, lowest latency) | completion
+                        (release followers only after the leader fully streamed —
+                        the boundary cache unit is persisted then; max hit odds)
   PERMAFROST_KEEPALIVE_S  OPT-IN: replay the last request (max_tokens=1) after this
                         many idle seconds to keep the cache warm (default 0 = off;
                         fires real billable requests at ~hit price)
@@ -106,7 +110,16 @@ def _normalize_beta(value: str) -> str:
 
 COALESCE = os.environ.get("PERMAFROST_COALESCE", "1") == "1"
 COALESCE_TIMEOUT_S = float(os.environ.get("PERMAFROST_COALESCE_TIMEOUT_S", "30"))
-COALESCE_SETTLE_MS = int(os.environ.get("PERMAFROST_COALESCE_SETTLE_MS", "0"))
+# DeepSeek's cache write is asynchronous: our live probes show an identical
+# request ~4s after the leader's first byte still misses, ~6s hits. Releasing
+# followers with no settle mostly wastes the wait, so default to 2.5s.
+COALESCE_SETTLE_MS = int(os.environ.get("PERMAFROST_COALESCE_SETTLE_MS", "2500"))
+# first_byte: release followers at the leader's first upstream byte + settle
+#             (lowest added latency, cache write may still be in flight).
+# completion: release when the leader's response has fully streamed (the
+#             request-boundary cache unit is persisted right after) + settle —
+#             higher latency, maximum hit probability.
+COALESCE_RELEASE = os.environ.get("PERMAFROST_COALESCE_RELEASE", "first_byte")
 COALESCE_CAP = int(os.environ.get("PERMAFROST_COALESCE_CAP", "1024"))
 
 
@@ -361,25 +374,51 @@ class Stats:
         self.sessions: dict[str, dict] = {}
         self.recent: list[dict] = []
 
-    def record_request(self, report: pa.AlignReport, session: str | None) -> None:
+    _LINEAGE_CAP = 64
+    _EXCERPT = 70  # bytes of context shown on each side of a divergence
+
+    def record_request(self, report: pa.AlignReport, session: str | None,
+                       anchor_payload: bytes | None = None) -> None:
         with self.lock:
             self.requests += 1
             self.last_report = report.as_dict()
             anchor = report.anchor_fingerprint
-            lin = self.lineages.setdefault(report.lineage, {
-                "prev_anchor": None, "transitions": 0, "requests": 0})
+            lin = self.lineages.get(report.lineage)
+            if lin is None:
+                if len(self.lineages) >= self._LINEAGE_CAP:
+                    self.lineages.pop(next(iter(self.lineages)))
+                lin = self.lineages[report.lineage] = {
+                    "prev_anchor": None, "transitions": 0, "requests": 0,
+                    "last_payload": None}
             lin["requests"] += 1
             if lin["prev_anchor"] is not None and anchor != lin["prev_anchor"]:
                 lin["transitions"] += 1
-                self.prefix_changes.append({
+                change = {
                     "lineage": report.lineage,
                     "from": lin["prev_anchor"],
                     "to": anchor,
                     "request": self.requests,
                     "volatile_found": report.volatile_found,
-                })
+                }
+                # Self-debugging: show exactly where the anchor bytes diverged,
+                # so a future Claude Code release that introduces a new volatile
+                # pattern is diagnosed from /permafrost/doctor, not from a
+                # mysteriously sinking hit rate.
+                old = lin.get("last_payload")
+                if old is not None and anchor_payload is not None:
+                    n = min(len(old), len(anchor_payload))
+                    i = 0
+                    while i < n and old[i] == anchor_payload[i]:
+                        i += 1
+                    lo = max(0, i - self._EXCERPT)
+                    change["diverged_at_byte"] = i
+                    change["was"] = old[lo:i + self._EXCERPT].decode("utf-8", "replace")
+                    change["now"] = anchor_payload[lo:i + self._EXCERPT].decode("utf-8", "replace")
+                self.prefix_changes.append(change)
                 self.prefix_changes = self.prefix_changes[-20:]
             lin["prev_anchor"] = anchor
+            if anchor_payload is not None:
+                lin["last_payload"] = anchor_payload
             s = self.sessions.setdefault(session or "(none)", {
                 "requests": 0, "hit": 0, "miss": 0, "output": 0})
             s["requests"] += 1
@@ -421,7 +460,10 @@ class Stats:
                     k: dict(v, hit_rate=round(pa.hit_rate(v["hit"], v["miss"]), 3))
                     for k, v in self.sessions.items()
                 },
-                "lineages": {k: dict(v) for k, v in self.lineages.items()},
+                "lineages": {
+                    k: {kk: vv for kk, vv in v.items() if kk != "last_payload"}
+                    for k, v in self.lineages.items()
+                },
             }
 
 
@@ -567,7 +609,7 @@ class Handler(BaseHTTPRequestHandler):
                 session = pa.extract_session(body)
                 body, report = pa.align_request(body, MODE, store=FREEZE_STORE)
                 out_bytes = pa.canonical_dumps(body)
-                STATS.record_request(report, session)
+                STATS.record_request(report, session, pa.anchor_payload(body))
                 KEEPALIVE.note_request(body, dict(self.headers), report.anchor_fingerprint)
                 if DUMP_DIR:
                     self._dump_anchor(body, report)
@@ -583,8 +625,11 @@ class Handler(BaseHTTPRequestHandler):
             COALESCER.wait_follower(gate)
             self._forward("POST", out_bytes, report, session=session)
         elif role == "leader":
+            # completion policy: followers stay parked until warm()/fail() below,
+            # i.e. after the leader's response fully streamed.
+            cb = (lambda: COALESCER.release(gate)) if COALESCE_RELEASE == "first_byte" else None
             status = self._forward("POST", out_bytes, report, session=session,
-                                   first_byte_cb=lambda: COALESCER.release(gate))
+                                   first_byte_cb=cb)
             if status is not None and status < 400:
                 COALESCER.warm(fp, gate)
             else:

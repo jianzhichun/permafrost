@@ -1,0 +1,52 @@
+{
+  "model": "claude-sonnet-4-6",
+  "max_tokens": 32000,
+  "stream": true,
+  "metadata": {
+    "user_id": "{\"device_id\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"account_uuid\":\"\",\"session_id\":\"00000000-0000-4000-8000-000000000000\"}"
+  },
+  "system": [
+    {
+      "type": "text",
+      "text": "x-anthropic-billing-header: cc_version=2.1.170.acc; cc_entrypoint=sdk-cli; cch=bcc4d;",
+      "cache_control": { "type": "ephemeral" }
+    },
+    {
+      "type": "text",
+      "text": "You are a CLI coding agent (fixture stand-in for the small stable block)."
+    },
+    {
+      "type": "text",
+      "text": "You are an interactive agent that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user. This fixture reproduces the STRUCTURE of a real Claude Code request without shipping its actual system prompt: a large, stable instruction body followed by the environment context that Claude Code embeds in the same system block. Follow the user's instructions precisely, prefer minimal diffs, run the tests before claiming success, and report outcomes faithfully. Use the Read tool before editing a file, keep code comments rare and load-bearing, and never invent URLs. When a task is ambiguous, state your assumption and proceed rather than stalling. <env>\nWorking directory: /home/user/repo\nIs directory a git repo: yes\nPlatform: linux\nOS Version: Linux 6.8.0\nToday's date: 2026-06-10\nCurrent branch: main\ngitStatus: M src/a.py\n</env>",
+      "cache_control": { "type": "ephemeral" }
+    }
+  ],
+  "tools": [
+    { "name": "Bash", "description": "Executes a bash command", "input_schema": { "type": "object", "properties": { "command": { "type": "string" } }, "required": ["command"] } },
+    { "name": "Read", "description": "Reads a file", "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" } }, "required": ["file_path"] } },
+    { "name": "Edit", "description": "Edits a file", "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" }, "old_string": { "type": "string" }, "new_string": { "type": "string" } }, "required": ["file_path", "old_string", "new_string"] } },
+    { "name": "Write", "description": "Writes a file", "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" }, "content": { "type": "string" } }, "required": ["file_path", "content"] } },
+    { "name": "Glob", "description": "File pattern matching", "input_schema": { "type": "object", "properties": { "pattern": { "type": "string" } }, "required": ["pattern"] } },
+    { "name": "Grep", "description": "Content search", "input_schema": { "type": "object", "properties": { "pattern": { "type": "string" } }, "required": ["pattern"] } },
+    { "name": "Agent", "description": "Launches a subagent", "input_schema": { "type": "object", "properties": { "prompt": { "type": "string" } }, "required": ["prompt"] } },
+    { "name": "ToolSearch", "description": "Loads deferred tools", "input_schema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] } },
+    { "name": "mcp__github__list_prs", "description": "Lists pull requests", "input_schema": { "type": "object", "properties": { "repo": { "type": "string" } }, "required": ["repo"] } },
+    { "name": "mcp__postgres__query", "description": "Runs a SQL query", "input_schema": { "type": "object", "properties": { "sql": { "type": "string" } }, "required": ["sql"] } }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "<system-reminder>\nAs you answer, you can use the following project context (fixture stand-in for CLAUDE.md attachments).\n</system-reminder>"
+        },
+        {
+          "type": "text",
+          "text": "Read calc.py, then fix the divide-by-zero bug in divide().",
+          "cache_control": { "type": "ephemeral" }
+        }
+      ]
+    }
+  ]
+}

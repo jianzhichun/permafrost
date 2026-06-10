@@ -181,6 +181,15 @@ concurrent same-anchor bursts wait, with a timeout guard against a stuck leader.
 `/permafrost:doctor` reports how many followers it held. Toggle with
 `PERMAFROST_COALESCE=0`.
 
+Release timing is a measured trade-off: DeepSeek's cache write is asynchronous
+(our probes: ~4s after first byte still misses, ~6s hits), so followers wait a
+`PERMAFROST_COALESCE_SETTLE_MS` (default 2500) after release — the default
+itself is live-validated: a 3-request cold burst under default settings had
+**both followers hit in full** (settle 0 scored 0% on the same shape). For maximum hit
+odds set `PERMAFROST_COALESCE_RELEASE=completion` — followers go only after the
+leader's response fully streams, which is when the request-boundary cache unit
+persists.
+
 **Live-validated:** 4 concurrent cold-anchor requests to real DeepSeek went from
 **0% hit (off)** — all four miss, 16,356 tokens at full price — to **73% hit
 (on)**, where one leader warmed the cache and three followers read it. The cost
@@ -200,12 +209,19 @@ manually. Live-validated at **99.9% hit** on a real CC request replay; the
 includes the client's header fingerprint, and replays that differ in params or
 headers measurably miss (see [`docs/e2e-findings.md`](docs/e2e-findings.md)).
 
-### Per-session & per-lineage stats
+### Per-session & per-lineage stats, with anchor diffs
 
 `/permafrost/stats` buckets usage by Claude Code session id, and tracks anchor
 churn per *lineage* (stable system+tools ancestry) — so CC's tool-less preflight
 calls don't pollute the churn signal, and multiple sessions through one proxy
 stay readable.
+
+When an anchor *does* change within a lineage, the doctor shows **exactly where
+the bytes diverged** (`diverged_at_byte` plus `was`/`now` excerpts). That makes
+Permafrost self-debugging against future Claude Code releases: a new volatile
+pattern shows up as a readable diff in `/permafrost:doctor`, not as a
+mysteriously sinking hit rate. (This is precisely how we caught CC's `cch=`
+billing nonce.)
 
 Full mechanism: [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md).
 The complete catalogue of Claude Code cache-busters it defends against —
@@ -256,7 +272,8 @@ Full survey: [`docs/landscape.md`](docs/landscape.md).
 | `PERMAFROST_NORMALIZE_BETA` | `1` | sort + dedup the `anthropic-beta` header (never adds/drops a flag) |
 | `PERMAFROST_COALESCE` | `1` | hold parallel cold-anchor requests until the first warms the cache (`0` disables) |
 | `PERMAFROST_COALESCE_TIMEOUT_S` | `30` | follower deadlock guard |
-| `PERMAFROST_COALESCE_SETTLE_MS` | `0` | extra wait after release, to let DeepSeek's async cache settle |
+| `PERMAFROST_COALESCE_SETTLE_MS` | `2500` | extra wait after release, to let DeepSeek's async cache write land |
+| `PERMAFROST_COALESCE_RELEASE` | `first_byte` | or `completion`: release followers only after the leader fully streams (max hit odds, more latency) |
 | `PERMAFROST_KEEPALIVE_S` | `0` (off) | opt-in: replay the last request unchanged after this much idle, keeping the prefix warm at hit price |
 | `PERMAFROST_KEEPALIVE_IDLE_STOP_S` | `7200` | stop keepalives after this much idle (abandoned-session guard) |
 | `PERMAFROST_PRICES` | V4 Flash | `"hit,miss,output"` USD/1M for the cost readout |

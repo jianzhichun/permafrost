@@ -455,6 +455,14 @@ def detect_volatile(body: dict[str, Any]) -> dict[str, int]:
     return found
 
 
+def anchor_payload(body: dict[str, Any]) -> bytes:
+    """The cacheable anchor (tools + system) as canonical bytes.
+
+    The fingerprint hashes this; the doctor diffs consecutive payloads of the
+    same lineage to show exactly which bytes changed when an anchor resets."""
+    return canonical_dumps({"tools": body.get("tools"), "system": body.get("system")})
+
+
 def anchor_fingerprint(body: dict[str, Any]) -> tuple[str, int]:
     """Hash of the cacheable anchor (tools + system) after alignment.
 
@@ -462,9 +470,7 @@ def anchor_fingerprint(body: dict[str, Any]) -> tuple[str, int]:
     will hit DeepSeek's cache for the whole anchor. Tracking it across turns is
     how /permafrost/doctor proves the prefix is — or isn't — staying frozen.
     """
-    anchor = canonical_dumps(
-        {"tools": body.get("tools"), "system": body.get("system")}
-    )
+    anchor = anchor_payload(body)
     return hashlib.sha256(anchor).hexdigest()[:12], len(anchor)
 
 

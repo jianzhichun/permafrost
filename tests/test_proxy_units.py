@@ -183,6 +183,38 @@ def test_stats_buckets_usage_per_session() -> None:
     assert snap["cache_hit_tokens"] == 150  # global totals still aggregate
 
 
+def test_coalesce_completion_policy_releases_on_warm() -> None:
+    """With release=completion the proxy never calls release(); followers must
+    be freed by warm() (leader fully streamed) instead."""
+    c = pp.Coalescer(enabled=True, timeout_s=3.0)
+    _, gate = c.begin("fpc")
+    role, fgate = c.begin("fpc")
+    assert role == "follower"
+    released: list[int] = []
+    t = threading.Thread(target=lambda: (c.wait_follower(fgate), released.append(1)))
+    t.start()
+    assert not released
+    c.warm("fpc", gate)          # completion-path release
+    t.join(timeout=3)
+    assert released == [1]
+    assert c.begin("fpc")[0] == "pass"
+
+
+def test_stats_anchor_diff_shows_divergence() -> None:
+    s = pp.Stats()
+    old = b'{"tools":[],"system":"stable prefix cch=bcc4d; trailing context"}'
+    new = b'{"tools":[],"system":"stable prefix cch=a8245; trailing context"}'
+    s.record_request(pa.AlignReport(lineage="lin", anchor_fingerprint="a1"), "s", old)
+    s.record_request(pa.AlignReport(lineage="lin", anchor_fingerprint="a2"), "s", new)
+    assert len(s.prefix_changes) == 1
+    ch = s.prefix_changes[0]
+    assert ch["diverged_at_byte"] == old.index(b"bcc4d")
+    assert "bcc4d" in ch["was"] and "a8245" in ch["now"]
+    # excerpts are bounded and JSON-serializable via snapshot()
+    assert len(ch["was"]) <= 2 * s._EXCERPT and len(ch["now"]) <= 2 * s._EXCERPT
+    json.dumps(s.snapshot())
+
+
 def test_keepalive_state_machine() -> None:
     sent: list[dict] = []
 
