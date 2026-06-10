@@ -260,6 +260,22 @@ def test_keepalive_per_session_slots() -> None:
     assert len(ka.slots) == ka._SLOT_CAP and "sa" not in ka.slots
 
 
+def test_upstream_conn_pool_reuse_semantics() -> None:
+    # The retry-safety guard hinges on `reused`: only a pooled (reused) conn is
+    # safe to resend a POST on. A fresh conn must report reused=False.
+    pp._drop_upstream_conn()
+    c1, reused1 = pp._upstream_conn()
+    assert reused1 is False, "first conn is fresh"
+    c2, reused2 = pp._upstream_conn()
+    assert reused2 is True and c2 is c1, "second call reuses the pooled conn"
+    c3, reused3 = pp._upstream_conn(fresh=True)
+    assert reused3 is False and c3 is not c1, "fresh=True forces a new conn"
+    pp._drop_upstream_conn()
+    _, reused4 = pp._upstream_conn()
+    assert reused4 is False, "after drop, the next conn is fresh again"
+    pp._drop_upstream_conn()
+
+
 def _run_all() -> int:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

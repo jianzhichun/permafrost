@@ -86,15 +86,19 @@ _UP = urllib.parse.urlsplit(UPSTREAM)
 _TL = threading.local()
 
 
-def _upstream_conn(fresh: bool = False) -> http.client.HTTPConnection:
+def _upstream_conn(fresh: bool = False) -> tuple[http.client.HTTPConnection, bool]:
+    """Return (conn, reused). `reused` is True only when we handed back an
+    existing pooled connection — the one case where a send failure is a safely-
+    retryable stale keep-alive rather than a real (possibly half-applied) error."""
     conn = None if fresh else getattr(_TL, "conn", None)
+    reused = conn is not None
     if conn is None:
         if _UP.scheme == "https":
             conn = http.client.HTTPSConnection(_UP.hostname, _UP.port or 443, timeout=600)
         else:
             conn = http.client.HTTPConnection(_UP.hostname, _UP.port or 80, timeout=600)
         _TL.conn = conn
-    return conn
+    return conn, reused
 
 
 def _drop_upstream_conn() -> None:
@@ -733,8 +737,8 @@ class Handler(BaseHTTPRequestHandler):
         headers = self._build_upstream_headers()
 
         resp = None
-        for attempt in (0, 1):  # retry once on a stale pooled connection
-            conn = _upstream_conn(fresh=attempt > 0)
+        for attempt in (0, 1):  # retry once, but ONLY for a stale reused conn
+            conn, reused = _upstream_conn(fresh=attempt > 0)
             try:
                 conn.request(method, path, body=out_bytes, headers=headers)
                 resp = conn.getresponse()
@@ -742,7 +746,11 @@ class Handler(BaseHTTPRequestHandler):
             except (http.client.HTTPException, BrokenPipeError, ConnectionResetError,
                     ssl.SSLError, OSError) as e:
                 _drop_upstream_conn()
-                if attempt:
+                # Retry only when a *reused* keep-alive connection failed: the
+                # server closed it while idle, so our request never landed and a
+                # resend is safe. A fresh connection that failed is a genuine
+                # error — resending a POST could double-charge / double-execute.
+                if attempt or not reused:
                     self._json(502, {"error": "upstream unreachable", "detail": str(e),
                                      "upstream": UPSTREAM})
                     return None
