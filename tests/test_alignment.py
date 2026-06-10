@@ -171,6 +171,22 @@ def test_freeze_beats_relocate_on_stable_env_bytes() -> None:
     assert freeze_tail < relocate_tail, f"freeze {freeze_tail} not < relocate {relocate_tail}"
 
 
+def test_billing_header_cch_nonce_stabilized() -> None:
+    """Real CC cache-buster: the x-anthropic-billing-header cch nonce, found via
+    the live-CC e2e. Two requests differing only in cch must align identically."""
+    def req(cch: str) -> dict:
+        return {"model": "m", "system": [
+            {"type": "text", "text": f"x-anthropic-billing-header: cc_version=2.1.170.acc; "
+                                     f"cc_entrypoint=sdk-cli; cch={cch};"},
+            {"type": "text", "text": "Big stable system prompt. " * 50}],
+            "tools": [], "messages": [{"role": "user", "content": "go"}]}
+    a, ra = pa.align_request(req("bcc4d"), "aggressive")
+    b, rb = pa.align_request(req("a8245"), "aggressive")
+    assert ra.metadata_stabilized == 1
+    assert ra.anchor_fingerprint == rb.anchor_fingerprint, "cch nonce should be neutralized"
+    assert "cch=permafrost;" in json.dumps(a["system"])
+
+
 def test_normalize_usage_both_shapes() -> None:
     ds = pa.normalize_usage({"prompt_tokens": 1000, "prompt_cache_hit_tokens": 800,
                              "prompt_cache_miss_tokens": 200, "completion_tokens": 50})

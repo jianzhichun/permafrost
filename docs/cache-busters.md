@@ -36,6 +36,7 @@ So the enemy is *prefix instability*. Here is where Claude Code introduces it.
 | 7 | **Non-essential background traffic** (telemetry, title-gen, summaries) on different prefixes | separate requests | Each one-off prefix is a pure cache write, never read | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` |
 | 8 | **Re-sending `reasoning_content`** in history (only on the OpenAI-style endpoint) | `messages` | DeepSeek bills re-sent reasoning as input (~500 tok/turn in Reasonix's measurements) | N/A for the Anthropic passthrough (thinking blocks are append-only in the tail); documented for the OpenAI path |
 | 9 | **Non-deterministic JSON** — object-key reordering, `\uXXXX` escaping, whitespace | whole body | Byte-different serialization of identical content → prefix differs | `canonical_dumps`: compact separators, `ensure_ascii=False`, insertion-order (optional key sort) |
+| 10 | **The `x-anthropic-billing-header` system block** with a per-request `cch=<nonce>` (found on real CC traffic) | `system` (first block) | A 5-char nonce at the front of `system` changes the anchor fingerprint every request | `stabilize_metadata`: pin the `cch` value to a constant (telemetry the model ignores) |
 
 ## The "random header" worry, specifically
 

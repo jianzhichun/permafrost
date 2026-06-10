@@ -58,6 +58,14 @@ repeated prefix returns `hit=1536 miss=77` — a **95% cache hit** on the second
 identical request, confirming DeepSeek's automatic cache serves Permafrost's
 canonical request shape. (See [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).)
 
+**Validated with real Claude Code** (not synthetic requests): headless `claude -p`
+on a 4-turn fix-the-bug task, isolated, routed through Permafrost → DeepSeek —
+**66% cache hit rate, 64% cost reduction**, on ~85 KB / ~21 K tokens of genuine CC
+system prompt + tools. Reproduce: [`e2e/run_claude_code.sh`](e2e/run_claude_code.sh)
+(needs a funded `DEEPSEEK_API_KEY`). What this run taught us — including that
+DeepSeek re-renders before caching, and CC's per-request billing nonce — is in
+[`docs/e2e-findings.md`](docs/e2e-findings.md).
+
 **Validated through the proxy, too:** four real requests sent through Permafrost
 with *shuffled tool order and changing `git status` each time* — exactly the
 traffic that misses in `off` mode — were aligned to one frozen anchor

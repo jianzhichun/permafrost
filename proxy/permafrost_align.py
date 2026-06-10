@@ -89,6 +89,7 @@ class AlignReport:
     tools_count: int = 0
     cache_control_stripped: int = 0
     volatile_found: dict[str, int] = field(default_factory=dict)
+    metadata_stabilized: int = 0
     blocks_relocated: int = 0
     relocated_chars: int = 0
     env_frozen: bool = False
@@ -104,6 +105,7 @@ class AlignReport:
             "tools_count": self.tools_count,
             "cache_control_stripped": self.cache_control_stripped,
             "volatile_found": self.volatile_found,
+            "metadata_stabilized": self.metadata_stabilized,
             "blocks_relocated": self.blocks_relocated,
             "relocated_chars": self.relocated_chars,
             "env_frozen": self.env_frozen,
@@ -140,6 +142,37 @@ def _count_volatile(text: str) -> dict[str, int]:
 
 def _looks_like_env_block(text: str) -> bool:
     return any(m in text for m in _ENV_MARKERS)
+
+
+# Claude Code injects a billing-telemetry block as the FIRST system block,
+# carrying a per-request `cch=<nonce>` that changes every call. Sitting in the
+# cache prefix, that nonce busts the cache for the whole system prompt. Found on
+# real CC traffic (the SDK/CLI billing header); see docs/cache-busters.md.
+_BILLING_MARKER = "x-anthropic-billing-header"
+_RE_CCH = re.compile(r"(cch=)[^;\s]*")
+
+
+def stabilize_metadata(body: dict[str, Any], report: AlignReport) -> int:
+    """Pin per-request nonces in Claude Code's billing-header system block.
+
+    The block is telemetry the model ignores, so replacing its volatile `cch`
+    value with a constant is lossless — and it stops a 5-char nonce at the front
+    of the prefix from invalidating tens of thousands of cached system tokens.
+    """
+    system = body.get("system")
+    if not isinstance(system, list):
+        return 0
+    n = 0
+    for block in system:
+        if isinstance(block, dict):
+            text = block.get("text", "")
+            if _BILLING_MARKER in text:
+                new_text, k = _RE_CCH.subn(r"\1permafrost", text)
+                if k:
+                    block["text"] = new_text
+                    n += k
+    report.metadata_stabilized = n
+    return n
 
 
 def strip_cache_control(body: dict[str, Any]) -> int:
@@ -426,6 +459,7 @@ def align_request(body: dict[str, Any], mode: str = "aggressive",
 
     report.volatile_found = detect_volatile(body)
     report.cache_control_stripped = strip_cache_control(body)
+    stabilize_metadata(body, report)
     report.tools_sorted = sort_tools(body)
     report.tools_count = len(body.get("tools") or [])
 

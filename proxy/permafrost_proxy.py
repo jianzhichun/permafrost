@@ -28,6 +28,8 @@ Env:
   PERMAFROST_COALESCE_TIMEOUT_S  follower deadlock guard (default 30)
   PERMAFROST_COALESCE_SETTLE_MS  extra wait after release for async cache (default 0)
   PERMAFROST_PRICES     "hit,miss,output" USD per 1M to override the cost model
+  PERMAFROST_DUMP_DIR   debug: write each aligned request's full body here, to
+                        diff what a client varies between turns
 
 Local introspection (GET):
   /permafrost/health    liveness + config
@@ -57,6 +59,7 @@ MODE = os.environ.get("PERMAFROST_MODE", "aggressive")
 NORMALIZE_BETA = os.environ.get("PERMAFROST_NORMALIZE_BETA", "1") == "1"
 FREEZE_ENV = os.environ.get("PERMAFROST_FREEZE_ENV", "1") == "1"
 FREEZE_STORE = pa.FreezeStore() if FREEZE_ENV else None
+DUMP_DIR = os.environ.get("PERMAFROST_DUMP_DIR")  # debug: write each request's anchor here
 
 _HOP_BY_HOP = {
     "host", "content-length", "connection", "keep-alive", "proxy-authenticate",
@@ -400,6 +403,8 @@ class Handler(BaseHTTPRequestHandler):
                 body, report = pa.align_request(body, MODE, store=FREEZE_STORE)
                 out_bytes = pa.canonical_dumps(body)
                 STATS.record_request(report)
+                if DUMP_DIR:
+                    self._dump_anchor(body, report)
             except (ValueError, TypeError) as e:
                 out_bytes = raw  # never let alignment break a request
                 report = None
@@ -420,6 +425,21 @@ class Handler(BaseHTTPRequestHandler):
                 COALESCER.fail(fp, gate)  # no usable cache write; let next retry
         else:  # pass / disabled
             self._forward("POST", out_bytes, report)
+
+    def _dump_anchor(self, body: dict, report) -> None:
+        """Debug: persist each request's cache anchor (tools + system) so a diff
+        can reveal exactly what real Claude Code varies between turns."""
+        try:
+            os.makedirs(DUMP_DIR, exist_ok=True)
+            n = STATS.requests
+            path = os.path.join(DUMP_DIR, f"req-{n:03d}-{report.anchor_fingerprint}.json")
+            # Dump the FULL forwarded body (canonical bytes) so a diff can show
+            # key order and exactly where consecutive requests diverge.
+            with open(path, "wb") as f:
+                f.write(pa.canonical_dumps(body))
+        except Exception as e:
+            if os.environ.get("PERMAFROST_VERBOSE") == "1":
+                sys.stderr.write(f"permafrost: dump failed: {e}\n")
 
     def _build_upstream_headers(self) -> dict[str, str]:
         headers = {}
