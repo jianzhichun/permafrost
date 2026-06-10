@@ -12,7 +12,7 @@
   cache-stable passthrough proxy · deterministic tool order · volatile-content relocation · live hit-rate statusline · zero deps
 </p>
 
-<p align="center"><strong>Every $100 of Claude API traffic runs for ~$3.20 through Permafrost + DeepSeek — same requests, live-measured. (~$8.80 without Permafrost.)</strong></p>
+<p align="center"><strong>Every $100 of Claude API traffic runs for ~$3.20 through Permafrost + DeepSeek — same requests, live-measured.</strong><br/><sub>~11× of that is just DeepSeek's pricing; Permafrost earns the rest by keeping the cache hitting on agentic traffic (MCP tools, subagents, idle gaps) where it otherwise busts toward ~$8.80.</sub></p>
 
 ---
 
@@ -45,25 +45,33 @@ at current official rates:
 |---|---:|---:|
 | Claude Sonnet 4.6, caching busted | $0.1981 | — |
 | Claude Sonnet 4.6, native caching working (66% hit) | $0.1014 | 1× |
-| DeepSeek v4-flash, bare env-var switch (cache all-miss) | $0.00896 † | **11× cheaper** |
+| DeepSeek v4-flash, cache busted (the agentic-churn case) | $0.00896 † | **11× cheaper** |
 | **DeepSeek v4-flash + Permafrost (66% hit)** | **$0.00324 †** | **31× cheaper (−96.8%)** |
 
-† live-measured, not estimated. The 31× factors cleanly: **11× from DeepSeek's
-pricing × 2.8× from Permafrost** keeping the cache hitting. Unit prices behind
-it (USD/1M tokens): cache-hit input $0.30 vs **$0.0028** (107×), miss input
-$3.00 vs $0.14 (21×), output $15 vs $0.28 (54×). On the Opus tier
-(`claude-opus*` maps to v4-pro) the same workload goes $0.169 → $0.0099, **17×
-cheaper**.
+† live-measured token counts (41,728 hit + 21,339 miss + 591 output), priced at
+official rates. The 31× factors into **11× from DeepSeek's pricing × 2.8× from
+Permafrost** keeping the cache hitting. Unit prices (USD/1M): cache-hit input
+$0.30 vs **$0.0028** (107×), miss input $3.00 vs $0.14 (21×), output $15 vs $0.28
+(54×). On the Opus tier (`claude-opus*` maps to v4-pro) the same workload goes
+$0.169 → $0.0099, **17× cheaper**.
 
 A neat cross-check: Claude Code itself priced one of our e2e requests at
 `total_cost_usd: $0.0625` (its own Sonnet-rate accounting); the same request
 through Permafrost → DeepSeek billed **$0.0029**.
 
-> **Honest caveats:** (1) this compares *price for identical traffic*, not model
-> quality — `deepseek-v4-flash` is not Claude Sonnet 4.6; whether the trade is
-> worth it is your call. (2) It's API-metered vs. API-metered; Claude Max
-> subscriptions price differently. (3) Rows 1→3 are DeepSeek's pricing doing the
-> work; rows 3→4 (−64%) are what Permafrost adds on top.
+> **Honest caveats:**
+> 1. This compares *price for identical traffic*, not model quality —
+>    `deepseek-v4-flash` is not Claude Sonnet 4.6; whether the trade is worth it
+>    is your call.
+> 2. API-metered vs. API-metered; Claude Max subscriptions price differently.
+> 3. The two factors are not equal. **Rows 1→3 (≈11×) are DeepSeek's pricing,
+>    independent of Permafrost.** Rows 3→4 (the 2.8× / −64%) is Permafrost keeping
+>    the cache hitting on *realistic agentic traffic* — MCP tool churn, parallel
+>    subagents, idle gaps — where bare DeepSeek's prefix busts toward all-miss
+>    (offline benchmark: `off` = **0%** under tool churn; live: fan-out **0%→73%**,
+>    keepalive **99.9%**). On a trivial single-agent session with stable tools and
+>    no parallelism, bare DeepSeek already caches and Permafrost's margin is small —
+>    its value is exactly the busting workloads.
 
 ## Proof
 
@@ -87,6 +95,12 @@ Quick single-task version (`e2e/run_claude_code.sh`): 66% hit / 64% cheaper on a
 these runs taught us about DeepSeek's cache (it re-renders before caching; cache
 identity includes the client header fingerprint; CC's per-request billing nonce)
 is in [`docs/e2e-findings.md`](docs/e2e-findings.md).
+
+("Cost saved" / "cheaper" here means *versus running the same tokens uncached* —
+the value of the cache Permafrost keeps hitting. On simple sessions DeepSeek
+caches much of that on its own; Permafrost's decisive contribution is the
+coalescing and keepalive phases above, and the tool-churn case where bare hit
+rate is 0%.)
 
 <details>
 <summary><b>Offline benchmark + earlier probes (no API key)</b></summary>
