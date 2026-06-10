@@ -215,6 +215,30 @@ def test_stats_anchor_diff_shows_divergence() -> None:
     json.dumps(s.snapshot())
 
 
+def test_upstream_headers_normalize_and_strip() -> None:
+    h = pp._upstream_headers([("anthropic-beta", "feat-b,feat-a,feat-b"), ("Host", "x"),
+                              ("content-length", "5"), ("x-api-key", "k"),
+                              ("user-agent", "claude-cli/2.1")])
+    assert h["anthropic-beta"] == "feat-a,feat-b"             # sorted + deduped
+    low = {k.lower() for k in h}
+    assert "host" not in low and "content-length" not in low  # hop-by-hop dropped
+    assert h["x-api-key"] == "k" and h["user-agent"] == "claude-cli/2.1"
+
+
+def test_keepalive_stores_forward_identical_headers() -> None:
+    # Regression: the keepalive replay must carry the SAME headers the forward
+    # sent (beta normalized), or its header fingerprint won't match what DeepSeek
+    # cached and the replay misses.
+    ka = pp.Keepalive(interval_s=10, idle_stop_s=100, sender=lambda b, h: None)
+    ka.note_request({"model": "m"},
+                    {"anthropic-beta": "b,a", "user-agent": "cc", "content-length": "3"},
+                    "anch", "s")
+    stored = ka.slots["s"]["headers"]
+    assert stored["anthropic-beta"] == "a,b"                 # normalized like the forward
+    assert "content-length" not in {k.lower() for k in stored}
+    assert stored["user-agent"] == "cc"
+
+
 def test_keepalive_state_machine() -> None:
     sent: list[dict] = []
 

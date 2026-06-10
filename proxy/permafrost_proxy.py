@@ -51,9 +51,7 @@ import ssl
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -138,6 +136,21 @@ def _normalize_beta(value: str) -> str:
     """
     parts = [p.strip() for p in value.split(",") if p.strip()]
     return ",".join(sorted(dict.fromkeys(parts)))
+
+
+def _upstream_headers(items) -> dict[str, str]:
+    """The exact header set forwarded upstream: hop-by-hop dropped, anthropic-beta
+    normalized. Used by BOTH the live forward and the keepalive replay so their
+    header fingerprints match — DeepSeek's cache identity includes the headers, so
+    a replay with even a differently-ordered beta value would miss."""
+    out: dict[str, str] = {}
+    for k, v in items:
+        if k.lower() in _HOP_BY_HOP:
+            continue
+        if NORMALIZE_BETA and k.lower() == "anthropic-beta" and v:
+            v = _normalize_beta(v)
+        out[k] = v
+    return out
 
 
 COALESCE = os.environ.get("PERMAFROST_COALESCE", "1") == "1"
@@ -303,12 +316,11 @@ class Keepalive:
     # -- recording real traffic ------------------------------------------------
     def note_request(self, body: dict, headers: dict[str, str], anchor: str,
                      session: str | None = None) -> None:
-        # Keep the client's FULL header set (minus hop-by-hop). Measured live:
-        # replaying an identical body with only the auth headers misses the
-        # original's cache — DeepSeek's cache identity includes the client's
-        # header fingerprint, so the replay must look exactly like the client.
-        kept = {k: v for k, v in headers.items()
-                if k.lower() not in _HOP_BY_HOP and k.lower() != "content-length"}
+        # Store the EXACT headers the forward used (hop-by-hop dropped, beta
+        # normalized) — measured live: DeepSeek's cache identity includes the
+        # client header fingerprint, so the replay must match the forward, not
+        # just the raw client headers.
+        kept = _upstream_headers(headers.items())
         key = session or "(none)"
         with self.lock:
             self.slots.pop(key, None)  # re-insert = move to MRU position
@@ -366,13 +378,20 @@ class Keepalive:
 
     @staticmethod
     def _http_send(body: dict, headers: dict[str, str]) -> dict | None:
-        data = pa.canonical_dumps(body)
+        # Use http.client (NOT urllib) so the replay carries only the stored
+        # headers — urllib injects its own User-Agent/Accept-Encoding/Connection,
+        # which would change the header fingerprint and miss the cache.
         h = dict(headers)
-        h["content-type"] = "application/json"
-        req = urllib.request.Request(UPSTREAM + "/v1/messages", data=data,
-                                     headers=h, method="POST")
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            text = resp.read().decode("utf-8", "replace")
+        h.setdefault("content-type", "application/json")
+        conn = (http.client.HTTPSConnection(_UP.hostname, _UP.port or 443, timeout=120)
+                if _UP.scheme == "https"
+                else http.client.HTTPConnection(_UP.hostname, _UP.port or 80, timeout=120))
+        try:
+            conn.request("POST", _UP.path.rstrip("/") + "/v1/messages",
+                         body=pa.canonical_dumps(body), headers=h)
+            text = conn.getresponse().read().decode("utf-8", "replace")
+        finally:
+            conn.close()
         return _sniff_usage(text)  # handles both plain JSON and SSE bodies
 
     def loop(self) -> None:
@@ -657,7 +676,7 @@ class Handler(BaseHTTPRequestHandler):
             if usage is None:
                 return self._json(409, {"warmed": False,
                                         "reason": "no request seen yet this proxy lifetime; "
-                                                  "use `permafrost warm` (disk replay)"})
+                                                  "run one request through the proxy first"})
             return self._json(200, {"warmed": True, "usage": usage})
 
         out_bytes = raw
@@ -711,14 +730,7 @@ class Handler(BaseHTTPRequestHandler):
                 sys.stderr.write(f"permafrost: dump failed: {e}\n")
 
     def _build_upstream_headers(self) -> dict[str, str]:
-        headers = {}
-        for k, v in self.headers.items():
-            if k.lower() in _HOP_BY_HOP:
-                continue
-            if NORMALIZE_BETA and k.lower() == "anthropic-beta" and v:
-                v = _normalize_beta(v)
-            headers[k] = v
-        return headers
+        return _upstream_headers(self.headers.items())
 
     def _forward(self, method: str, out_bytes: bytes | None, report,
                  session: str | None = None, first_byte_cb=None) -> int | None:
