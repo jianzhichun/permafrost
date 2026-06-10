@@ -141,7 +141,7 @@ held the anchor stable despite the naive-client churn — including over the
 | | |
 |---|---|
 | **Prefix alignment** | deterministic tool sort · `cache_control` strip · env freeze+delta · billing-nonce stabilization · canonical UTF-8 serialization |
-| **Cold-anchor coalescing** | parallel subagent fan-out shares one cache write instead of N cold misses (first-byte or completion release) |
+| **Cold-anchor coalescing** | parallel subagent fan-out shares one cache write instead of N cold misses |
 | **Idle keepalive** | opt-in per-session replay keeps the prefix warm through think-time gaps (parallel sessions all stay warm) |
 | **Live diagnostics** | `/permafrost:status` `:doctor` `:benchmark` savings statusline · per-session + per-lineage stats · byte-level anchor diffs |
 | **Engineering** | zero deps (stdlib Python) · pooled upstream connections (no per-request TLS) · loopback-only control endpoints · streaming passthrough |
@@ -220,12 +220,9 @@ concurrent same-anchor bursts wait, with a timeout guard against a stuck leader.
 
 Release timing is a measured trade-off: DeepSeek's cache write is asynchronous
 (our probes: ~4s after first byte still misses, ~6s hits), so followers wait a
-`PERMAFROST_COALESCE_SETTLE_MS` (default 2500) after release — the default
-itself is live-validated: a 3-request cold burst under default settings had
-**both followers hit in full** (settle 0 scored 0% on the same shape). For maximum hit
-odds set `PERMAFROST_COALESCE_RELEASE=completion` — followers go only after the
-leader's response fully streams, which is when the request-boundary cache unit
-persists.
+`PERMAFROST_COALESCE_SETTLE_MS` (default 2500) after the leader's first byte —
+the default is live-validated: a 3-request cold burst under default settings had
+**both followers hit in full** (settle 0 scored 0% on the same shape).
 
 **Live-validated:** 4 concurrent cold-anchor requests to real DeepSeek went from
 **0% hit (off)** — all four miss, 16,356 tokens at full price — to **73% hit
@@ -311,7 +308,6 @@ Full survey: [`docs/landscape.md`](docs/landscape.md).
 | `PERMAFROST_COALESCE` | `1` | hold parallel cold-anchor requests until the first warms the cache (`0` disables) |
 | `PERMAFROST_COALESCE_TIMEOUT_S` | `30` | follower deadlock guard |
 | `PERMAFROST_COALESCE_SETTLE_MS` | `2500` | extra wait after release, to let DeepSeek's async cache write land |
-| `PERMAFROST_COALESCE_RELEASE` | `first_byte` | or `completion`: release followers only after the leader fully streams (max hit odds, more latency) |
 | `PERMAFROST_KEEPALIVE_S` | `0` (off) | opt-in: replay the last request unchanged after this much idle, keeping the prefix warm at hit price |
 | `PERMAFROST_KEEPALIVE_IDLE_STOP_S` | `7200` | stop keepalives after this much idle (abandoned-session guard) |
 | `PERMAFROST_PRICES` | V4 Flash | `"hit,miss,output"` USD/1M for the cost readout |

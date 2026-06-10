@@ -28,9 +28,6 @@ Env:
   PERMAFROST_COALESCE_TIMEOUT_S  follower deadlock guard (default 30)
   PERMAFROST_COALESCE_SETTLE_MS  extra wait after release for the async cache
                         write to land (default 2500; live probes show ~6s to settle)
-  PERMAFROST_COALESCE_RELEASE  first_byte (default, lowest latency) | completion
-                        (release followers only after the leader fully streamed —
-                        the boundary cache unit is persisted then; max hit odds)
   PERMAFROST_KEEPALIVE_S  OPT-IN: replay the last request (max_tokens=1) after this
                         many idle seconds to keep the cache warm (default 0 = off;
                         fires real billable requests at ~hit price)
@@ -148,13 +145,13 @@ COALESCE_TIMEOUT_S = float(os.environ.get("PERMAFROST_COALESCE_TIMEOUT_S", "30")
 # DeepSeek's cache write is asynchronous: our live probes show an identical
 # request ~4s after the leader's first byte still misses, ~6s hits. Releasing
 # followers with no settle mostly wastes the wait, so default to 2.5s.
+# followers are released at the leader's first upstream byte, then wait this
+# settle for the async cache write to land (validated: 2.5s gives a cold-burst
+# follower a full hit; 0 scored 0%). A "wait for full leader stream" policy was
+# tried and dropped — dominated by first_byte+settle, and it deadlocks against
+# the follower timeout on long agent turns (followers wait out the timeout AND
+# still miss).
 COALESCE_SETTLE_MS = int(os.environ.get("PERMAFROST_COALESCE_SETTLE_MS", "2500"))
-# first_byte: release followers at the leader's first upstream byte + settle
-#             (lowest added latency, cache write may still be in flight).
-# completion: release when the leader's response has fully streamed (the
-#             request-boundary cache unit is persisted right after) + settle —
-#             higher latency, maximum hit probability.
-COALESCE_RELEASE = os.environ.get("PERMAFROST_COALESCE_RELEASE", "first_byte")
 COALESCE_CAP = int(os.environ.get("PERMAFROST_COALESCE_CAP", "1024"))
 
 
@@ -689,11 +686,8 @@ class Handler(BaseHTTPRequestHandler):
             COALESCER.wait_follower(gate)
             self._forward("POST", out_bytes, report, session=session)
         elif role == "leader":
-            # completion policy: followers stay parked until warm()/fail() below,
-            # i.e. after the leader's response fully streamed.
-            cb = (lambda: COALESCER.release(gate)) if COALESCE_RELEASE == "first_byte" else None
             status = self._forward("POST", out_bytes, report, session=session,
-                                   first_byte_cb=cb)
+                                   first_byte_cb=lambda: COALESCER.release(gate))
             if status is not None and status < 400:
                 COALESCER.warm(fp, gate)
             else:

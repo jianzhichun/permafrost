@@ -183,9 +183,9 @@ def test_stats_buckets_usage_per_session() -> None:
     assert snap["cache_hit_tokens"] == 150  # global totals still aggregate
 
 
-def test_coalesce_completion_policy_releases_on_warm() -> None:
-    """With release=completion the proxy never calls release(); followers must
-    be freed by warm() (leader fully streamed) instead."""
+def test_coalesce_warm_releases_followers() -> None:
+    """warm() is the fail-safe: even if the leader's first-byte release never
+    fired (empty/odd response), a finished leader must free its followers."""
     c = pp.Coalescer(enabled=True, timeout_s=3.0)
     _, gate = c.begin("fpc")
     role, fgate = c.begin("fpc")
@@ -194,7 +194,7 @@ def test_coalesce_completion_policy_releases_on_warm() -> None:
     t = threading.Thread(target=lambda: (c.wait_follower(fgate), released.append(1)))
     t.start()
     assert not released
-    c.warm("fpc", gate)          # completion-path release
+    c.warm("fpc", gate)          # fail-safe release
     t.join(timeout=3)
     assert released == [1]
     assert c.begin("fpc")[0] == "pass"
