@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "proxy"))
@@ -72,6 +73,67 @@ def test_normalize_usage_counts_cache_creation_as_miss() -> None:
         "cache_read_input_tokens": 770, "output_tokens": 40,
     })
     assert u == {"input": 1000, "hit": 770, "miss": 230, "output": 40}
+
+
+def test_coalesce_holds_followers_until_leader_releases() -> None:
+    c = pp.Coalescer(enabled=True, timeout_s=3.0)
+    role, gate = c.begin("fp1")
+    assert role == "leader"
+
+    barrier = threading.Barrier(4)  # 3 followers + main
+    roles: list[str] = []
+    released: list[int] = []
+
+    def follower() -> None:
+        r, g = c.begin("fp1")
+        roles.append(r)
+        barrier.wait()          # all begin() calls are done
+        c.wait_follower(g)      # blocks until the leader releases
+        released.append(1)
+
+    threads = [threading.Thread(target=follower) for _ in range(3)]
+    for t in threads:
+        t.start()
+    barrier.wait()
+    assert roles == ["follower"] * 3
+    assert c.held == 3
+    assert released == []        # still parked — leader hasn't fired a byte
+
+    c.release(gate)              # leader's first upstream byte
+    for t in threads:
+        t.join(timeout=3)
+    assert len(released) == 3
+    assert c.released == 3 and c.leaders == 1 and c.timeouts == 0
+
+    c.warm("fp1", gate)          # leader finished — anchor is warm for good
+    assert c.begin("fp1")[0] == "pass"
+
+
+def test_coalesce_follower_times_out() -> None:
+    c = pp.Coalescer(enabled=True, timeout_s=0.2)
+    c.begin("x")                 # leader, never releases
+    role, gate = c.begin("x")
+    assert role == "follower"
+    c.wait_follower(gate)        # ~0.2s then gives up
+    assert c.timeouts == 1
+
+
+def test_coalesce_failed_leader_lets_next_be_leader() -> None:
+    c = pp.Coalescer(enabled=True)
+    _, g = c.begin("y")
+    c.fail("y", g)               # upstream unreachable: drop the anchor
+    assert c.begin("y")[0] == "leader"
+    assert c.leaders == 2
+
+
+def test_coalesce_disabled_passes_through() -> None:
+    c = pp.Coalescer(enabled=False)
+    assert c.begin("z") == ("pass", None)
+
+
+def test_coalesce_no_fingerprint_passes() -> None:
+    c = pp.Coalescer(enabled=True)
+    assert c.begin(None) == ("pass", None)
 
 
 def _run_all() -> int:

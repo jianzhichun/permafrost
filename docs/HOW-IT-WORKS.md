@@ -69,6 +69,37 @@ keeps a session running total: hit rate, dollar cost vs. an all-miss baseline,
 and the count of prefix resets. `GET /permafrost/stats` returns it; the
 statusline renders it as `❄ 88% cache hit · $0.12 saved`.
 
+## Cold-anchor coalescing
+
+A frozen anchor only helps if the cache for it actually exists. DeepSeek writes
+its cache **asynchronously** — a prefix becomes readable only after the request
+that wrote it has begun streaming (our live probe saw a repeat 4s later still
+miss, and a 6s-later one hit). Claude Code's `Task` tool fans out subagents in
+**parallel**: N requests that share one brand-new anchor fire at once, and
+because none of them can read a cache the others are still writing, all N pay the
+cold-miss price.
+
+The coalescer (`Coalescer` in `permafrost_proxy.py`) collapses that burst:
+
+1. The first request on an **unseen** anchor becomes the **leader** and goes
+   straight through (it warms the cache).
+2. Concurrent **same-anchor** requests become **followers** and block on a
+   per-anchor gate.
+3. When the leader's response **starts streaming** (first upstream byte), the
+   gate opens and the followers proceed — now reading the warm prefix. This is
+   the documented "fire one, await the first token, then fan out the rest"
+   pattern, enforced at the proxy.
+4. Once the leader finishes a usable (`<400`) response, the anchor is marked
+   **warm** and all future requests pass through with no wait.
+
+Guarantees: a **lone** request is its own leader and is never delayed; a follower
+never waits past `PERMAFROST_COALESCE_TIMEOUT_S` (deadlock guard); a leader that
+can't reach the upstream drops the anchor so the next request retries cleanly.
+`PERMAFROST_COALESCE_SETTLE_MS` adds an optional pause after release for the
+async write to settle. Honest caveat: releasing at the leader's first byte means
+the *very first* follower may still partially miss if DeepSeek's write hasn't
+landed; the rest of the burst, and every later burst on the now-warm anchor, hit.
+
 ## Why a proxy and not just hooks
 
 A plugin's hooks and commands never touch the request bytes — only a process at

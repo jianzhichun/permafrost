@@ -21,6 +21,10 @@ Env:
   PERMAFROST_UPSTREAM   (default https://api.deepseek.com/anthropic)
   PERMAFROST_MODE       off | safe | aggressive   (default aggressive)
   PERMAFROST_NORMALIZE_BETA  1 to sort+dedup the anthropic-beta header (default 1)
+  PERMAFROST_COALESCE   1 to hold parallel cold-anchor requests until the first
+                        one warms the cache (default 1); 0 disables
+  PERMAFROST_COALESCE_TIMEOUT_S  follower deadlock guard (default 30)
+  PERMAFROST_COALESCE_SETTLE_MS  extra wait after release for async cache (default 0)
   PERMAFROST_PRICES     "hit,miss,output" USD per 1M to override the cost model
 
 Local introspection (GET):
@@ -87,6 +91,119 @@ def _normalize_beta(value: str) -> str:
     """
     parts = [p.strip() for p in value.split(",") if p.strip()]
     return ",".join(sorted(dict.fromkeys(parts)))
+
+
+COALESCE = os.environ.get("PERMAFROST_COALESCE", "1") == "1"
+COALESCE_TIMEOUT_S = float(os.environ.get("PERMAFROST_COALESCE_TIMEOUT_S", "30"))
+COALESCE_SETTLE_MS = int(os.environ.get("PERMAFROST_COALESCE_SETTLE_MS", "0"))
+COALESCE_CAP = int(os.environ.get("PERMAFROST_COALESCE_CAP", "1024"))
+
+
+class Coalescer:
+    """Cold-anchor coalescing for parallel fan-out (e.g. CC Task subagents).
+
+    DeepSeek's cache is written asynchronously, so N requests that share a brand
+    new prefix and fire at once all miss — none can read what the others are
+    still writing. The coalescer lets the *first* request on an unseen anchor
+    through as the "leader" and holds same-anchor "followers" until the leader's
+    response starts streaming (the cache write has begun), then releases them so
+    they read the warm prefix instead of all paying the cold-miss price.
+
+    Single requests are never delayed: a lone request is its own leader and
+    passes straight through. Only concurrent same-anchor bursts wait. Once an
+    anchor is warm, everyone passes immediately. A follower never waits past
+    `timeout_s` (deadlock guard).
+    """
+
+    def __init__(self, enabled: bool = True, timeout_s: float = 30.0,
+                 settle_ms: int = 0, cap: int = 1024) -> None:
+        self.enabled = enabled
+        self.timeout_s = timeout_s
+        self.settle_ms = settle_ms
+        self.cap = cap
+        self.lock = threading.Lock()
+        self.anchors: dict[str, dict] = {}  # fp -> {"state": warming|warm, "gate": Event}
+        self._order: list[str] = []
+        self.leaders = 0
+        self.held = 0
+        self.released = 0
+        self.timeouts = 0
+
+    def _put(self, fp: str, entry: dict) -> None:
+        if fp in self.anchors:
+            self._order.remove(fp)
+        self.anchors[fp] = entry
+        self._order.append(fp)
+        while len(self._order) > self.cap:
+            self.anchors.pop(self._order.pop(0), None)
+
+    def begin(self, fp: str | None) -> tuple[str, threading.Event | None]:
+        """Classify a request: ('leader'|'follower'|'pass', gate)."""
+        if not self.enabled or not fp:
+            return ("pass", None)
+        with self.lock:
+            e = self.anchors.get(fp)
+            if e is None:
+                gate = threading.Event()
+                self._put(fp, {"state": "warming", "gate": gate})
+                self.leaders += 1
+                return ("leader", gate)
+            if e["state"] == "warm":
+                return ("pass", None)
+            self.held += 1
+            return ("follower", e["gate"])
+
+    def wait_follower(self, gate: threading.Event) -> None:
+        ok = gate.wait(timeout=self.timeout_s)
+        with self.lock:
+            if ok:
+                self.released += 1
+            else:
+                self.timeouts += 1
+        if ok and self.settle_ms:
+            time.sleep(self.settle_ms / 1000.0)
+
+    def release(self, gate: threading.Event | None) -> None:
+        """Leader got its first upstream byte — let the followers go."""
+        if gate is not None:
+            gate.set()
+
+    def warm(self, fp: str | None, gate: threading.Event | None) -> None:
+        """Leader finished a usable response — mark the anchor warm for good."""
+        if fp:
+            with self.lock:
+                e = self.anchors.get(fp)
+                if e is not None:
+                    e["state"] = "warm"
+        if gate is not None:
+            gate.set()
+
+    def fail(self, fp: str | None, gate: threading.Event | None) -> None:
+        """Leader never reached a usable response — drop the anchor so the next
+        request becomes a fresh leader, and release any waiters (they go cold,
+        no worse than baseline)."""
+        if fp:
+            with self.lock:
+                self.anchors.pop(fp, None)
+                if fp in self._order:
+                    self._order.remove(fp)
+        if gate is not None:
+            gate.set()
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {
+                "enabled": self.enabled,
+                "leaders": self.leaders,
+                "followers_held": self.held,
+                "followers_released": self.released,
+                "timeouts": self.timeouts,
+                "tracked_anchors": len(self.anchors),
+            }
+
+
+COALESCER = Coalescer(enabled=COALESCE, timeout_s=COALESCE_TIMEOUT_S,
+                      settle_ms=COALESCE_SETTLE_MS, cap=COALESCE_CAP)
 
 
 class Stats:
@@ -220,13 +337,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "mode": MODE, "upstream": UPSTREAM,
                                     "host": HOST, "port": PORT})
         if clean == "/permafrost/stats":
-            return self._json(200, STATS.snapshot())
+            snap = STATS.snapshot()
+            snap["coalesce"] = COALESCER.snapshot()
+            return self._json(200, snap)
         if clean == "/permafrost/doctor":
             with STATS.lock:
                 return self._json(200, {
                     "mode": MODE,
                     "last_request": STATS.last_report,
                     "prefix_changes": STATS.prefix_changes,
+                    "coalesce": COALESCER.snapshot(),
                     "advice": self._doctor_advice(),
                 })
         if clean.startswith("/permafrost/"):
@@ -250,6 +370,12 @@ class Handler(BaseHTTPRequestHandler):
                 f"The cache anchor changed {len(STATS.prefix_changes)}x this session. "
                 "Each change forces DeepSeek to re-read the whole prefix at full price."
             )
+        c = COALESCER.snapshot()
+        if c["enabled"] and c["followers_held"]:
+            advice.append(
+                f"Coalescing held {c['followers_held']} parallel same-anchor request(s) "
+                f"({c['timeouts']} timed out) so they could read a warm prefix instead "
+                "of all paying the cold-miss price.")
         if not advice:
             advice.append("Prefix anchor is stable. DeepSeek's cache is doing its job.")
         return advice
@@ -272,10 +398,24 @@ class Handler(BaseHTTPRequestHandler):
                 STATS.record_request(report)
             except (ValueError, TypeError) as e:
                 out_bytes = raw  # never let alignment break a request
+                report = None
                 if os.environ.get("PERMAFROST_VERBOSE") == "1":
                     sys.stderr.write(f"permafrost: align skipped: {e}\n")
 
-        self._forward("POST", out_bytes, report)
+        fp = report.anchor_fingerprint if report else None
+        role, gate = COALESCER.begin(fp)
+        if role == "follower":
+            COALESCER.wait_follower(gate)
+            self._forward("POST", out_bytes, report)
+        elif role == "leader":
+            status = self._forward("POST", out_bytes, report,
+                                   first_byte_cb=lambda: COALESCER.release(gate))
+            if status is not None and status < 400:
+                COALESCER.warm(fp, gate)
+            else:
+                COALESCER.fail(fp, gate)  # no usable cache write; let next retry
+        else:  # pass / disabled
+            self._forward("POST", out_bytes, report)
 
     def _build_upstream_headers(self) -> dict[str, str]:
         headers = {}
@@ -287,9 +427,12 @@ class Handler(BaseHTTPRequestHandler):
             headers[k] = v
         return headers
 
-    def _forward(self, method: str, out_bytes: bytes | None, report) -> None:
+    def _forward(self, method: str, out_bytes: bytes | None, report,
+                 first_byte_cb=None) -> int | None:
         # self.path already carries /v1/... plus any query string; UPSTREAM ends
         # at /anthropic, so the full URL is <upstream>/v1/messages[?query].
+        # Returns the upstream HTTP status, or None if the upstream was
+        # unreachable (so a coalescing leader knows whether a cache write happened).
         url = UPSTREAM + self.path if self.path.startswith("/") else UPSTREAM + "/" + self.path
         headers = self._build_upstream_headers()
         req = urllib.request.Request(url, data=out_bytes, headers=headers, method=method)
@@ -301,8 +444,9 @@ class Handler(BaseHTTPRequestHandler):
         except urllib.error.HTTPError as e:
             resp = e
         except urllib.error.URLError as e:
-            return self._json(502, {"error": "upstream unreachable", "detail": str(e),
-                                    "upstream": UPSTREAM})
+            self._json(502, {"error": "upstream unreachable", "detail": str(e),
+                             "upstream": UPSTREAM})
+            return None
 
         status = getattr(resp, "status", 200) or 200
         self.send_response(status)
@@ -313,11 +457,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
 
+        first = True
         try:
             while True:
                 chunk = resp.read(65536)
                 if not chunk:
                     break
+                if first:
+                    first = False
+                    if first_byte_cb is not None:
+                        try:
+                            first_byte_cb()  # release coalesced followers
+                        except Exception:
+                            pass
                 if len(head) < _SNIFF_HEAD:
                     head.extend(chunk[: _SNIFF_HEAD - len(head)])
                 tail.extend(chunk)
@@ -326,7 +478,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._write_chunk(chunk)
             self._write_chunk(b"")
         except (BrokenPipeError, ConnectionResetError):
-            return
+            return status
         finally:
             try:
                 resp.close()
@@ -339,6 +491,7 @@ class Handler(BaseHTTPRequestHandler):
             u = _merge_usage(u_head, u_tail)
             if u:
                 STATS.record_usage(u)
+        return status
 
     def _write_chunk(self, data: bytes) -> None:
         self.wfile.write(b"%X\r\n" % len(data))

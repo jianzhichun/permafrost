@@ -112,6 +112,19 @@ On every `/v1/messages` request, the alignment pipeline
 It then reads DeepSeek's `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
 straight off the response and tracks your live hit rate and dollar savings.
 
+### Cold-anchor coalescing (for parallel subagents)
+
+DeepSeek writes its cache *asynchronously*, so when Claude Code fans out `Task`
+subagents — N requests sharing one brand-new prefix, fired at once — none can
+read what the others are still writing, and **all N pay the cold-miss price**.
+Permafrost coalesces them: the first request on an unseen anchor goes through as
+the "leader" and warms the cache; same-anchor requests are held until the
+leader's response starts streaming, then released to read the warm prefix.
+Single requests are never delayed (a lone request *is* the leader); only
+concurrent same-anchor bursts wait, with a timeout guard against a stuck leader.
+`/permafrost:doctor` reports how many followers it held. Toggle with
+`PERMAFROST_COALESCE=0`.
+
 Full mechanism: [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md).
 The complete catalogue of Claude Code cache-busters it defends against —
 including the "random header" worry: [`docs/cache-busters.md`](docs/cache-busters.md).
@@ -158,6 +171,9 @@ Full survey: [`docs/landscape.md`](docs/landscape.md).
 | `PERMAFROST_UPSTREAM` | `https://api.deepseek.com/anthropic` | where to forward (any Anthropic-compatible endpoint works) |
 | `PERMAFROST_MODE` | `aggressive` | `off` / `safe` / `aggressive` |
 | `PERMAFROST_NORMALIZE_BETA` | `1` | sort + dedup the `anthropic-beta` header (never adds/drops a flag) |
+| `PERMAFROST_COALESCE` | `1` | hold parallel cold-anchor requests until the first warms the cache (`0` disables) |
+| `PERMAFROST_COALESCE_TIMEOUT_S` | `30` | follower deadlock guard |
+| `PERMAFROST_COALESCE_SETTLE_MS` | `0` | extra wait after release, to let DeepSeek's async cache settle |
 | `PERMAFROST_PRICES` | V4 Flash | `"hit,miss,output"` USD/1M for the cost readout |
 
 > The benchmark emulator measures byte-prefix overlap; DeepSeek matches a

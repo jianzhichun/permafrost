@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 RECORD = os.environ.get("MOCK_RECORD")
+DELAY = float(os.environ.get("MOCK_DELAY", "0") or 0)  # secs before responding
 
 SSE = (
     'data: {"type":"message_start","message":{"usage":{"input_tokens":120,'
@@ -40,6 +42,8 @@ class H(BaseHTTPRequestHandler):
         if RECORD:
             with open(RECORD + ".beta", "w") as f:
                 f.write(self.headers.get("anthropic-beta", ""))
+        if DELAY:
+            time.sleep(DELAY)  # hold the leader so followers queue up
         payload = SSE.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
