@@ -19,6 +19,7 @@ jobs:
           python3 tests/test_alignment.py
           python3 tests/test_proxy_units.py
           python3 tests/test_cc_fixture.py
+          python3 tests/test_emulator.py
       - name: proxy smoke test (isolated, local mock upstream)
         run: bash tests/proxy_smoke.sh
       - name: coalescing concurrency test (isolated)

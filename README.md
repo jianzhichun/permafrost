@@ -91,17 +91,22 @@ is in [`docs/e2e-findings.md`](docs/e2e-findings.md).
 <details>
 <summary><b>Offline benchmark + earlier probes (no API key)</b></summary>
 
-Emulator of DeepSeek's prefix cache (prefix-from-byte-0, block-quantized),
-replaying a 12-turn Claude-Code-shaped conversation. `off` = no alignment;
-`aggressive` = the default.
+Emulator rebuilt to match the live findings — it caches the **rendered** request
+(`tools → system → messages`, the order DeepSeek actually uses), unit-quantized,
+with params + header cache identity. 12-turn Claude-Code-shaped conversation;
+`off` = no alignment, `aggressive` = the default.
 
 | Scenario | Mode | Cache hit rate | Anchor resets | Cost (USD) |
 |---|---|---:|---:|---:|
-| C: realistic CC (tool churn + live git/env) | **off** | 66.4% | 11 | $0.00339 |
-| C: realistic CC (tool churn + live git/env) | **aggressive** | **88.4%** | **0** | **$0.00175** |
+| C: realistic CC (tool churn + live git/env) | **off** | **0%** | 11 | $0.00829 |
+| C: realistic CC (tool churn + live git/env) | **aggressive** | **88.4%** | **0** | **$0.00174** |
 
-**≈48% cheaper on identical traffic**, by driving the cache anchor from 11 resets
-to 0. The per-buster breakdown (tool-order churn alone, git/env alone, both) is in
+Because tools render *first*, a reshuffled tool list (MCP late-binding) busts the
+prefix at byte 0 — `off` caches nothing, `aggressive` (deterministic sort) holds
+88%. A faithfulness cross-check: the same traffic scores 88% under the rendered
+model but only ~5% under a naive raw-byte model — the raw model under-reports
+because real CC serializes `messages` first, bytes DeepSeek doesn't cache. The
+per-buster breakdown and the params-identity demo are in
 [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
 
 ```bash
