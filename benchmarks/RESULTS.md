@@ -23,3 +23,9 @@ Reproduce: `python3 benchmarks/bench.py --turns 12 --write benchmarks/RESULTS.md
 - **cost reduction**: 48.4% cheaper than off on identical traffic.
 
 Anchor resets = how many times the `tools`+`system` prefix changed bytes across the run. Every reset forces DeepSeek to re-read the whole prefix at full (miss) price. Permafrost's job is to drive this to 0.
+
+## Live DeepSeek probe
+
+```
+real probe: 2nd identical request -> hit=1536 miss=77 (hit_rate=95%) against https://api.deepseek.com/anthropic
+```

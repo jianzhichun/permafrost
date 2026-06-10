@@ -53,6 +53,11 @@ python3 benchmarks/bench.py --turns 12            # reproduce (no API key)
 python3 benchmarks/bench.py --real                # + live DeepSeek probe (needs key)
 ```
 
+**Live-validated** against the real `api.deepseek.com/anthropic` endpoint: a
+repeated prefix returns `hit=1536 miss=77` — a **95% cache hit** on the second
+identical request, confirming DeepSeek's automatic cache serves Permafrost's
+canonical request shape. (See [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).)
+
 > "Anchor resets" = how many times the `tools+system` prefix changed bytes across
 > the run. Each reset forces DeepSeek to re-read the whole prefix at full price.
 > Permafrost's job is to keep it at 0.
