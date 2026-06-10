@@ -67,9 +67,33 @@ through Permafrost → DeepSeek billed **$0.0029**.
 
 ## Proof
 
-Offline benchmark against a faithful emulator of DeepSeek's prefix cache
-(prefix-from-byte-0, block-quantized), replaying a 12-turn Claude-Code-shaped
-conversation. `off` = no alignment; `aggressive` = the default.
+**The headline: every feature, one live run — real Claude Code + real DeepSeek.**
+[`e2e/run_full_suite.sh`](e2e/run_full_suite.sh) drives headless `claude -p`
+through Permafrost across six phases with hard assertions. Latest run **15/15
+passed**, session total **71% cache hit / 68% cost saved**:
+
+| Phase | What's asserted against the live API | Result |
+|---|---|---|
+| Alignment & freeze | multi-turn CC task hits ≥50%; env frozen into anchor; cch nonce pinned | 66% hit ✓ |
+| Coalescing (real) | a real 3-subagent fan-out actually coalesces | 2 followers held ✓ |
+| Coalescing (cold burst) | 3 concurrent cold requests, default settle | 65% hit ✓ |
+| Keepalive + resume | keepalive fires on idle; a resumed session reads the warm cache | fired 4×, resume **96%** hit ✓ |
+| Warm endpoint | unchanged replay hits ≥90% | 99% ✓ |
+| Sessions & lineages | ≥2 session buckets; **0** within-lineage anchor churn | 3 buckets, 0 churn ✓ |
+| Doctor anchor-diff | a forced anchor change yields byte-level was/now | excerpts present ✓ |
+
+Quick single-task version (`e2e/run_claude_code.sh`): 66% hit / 64% cheaper on a
+4-turn task over ~85 KB / ~21 K tokens of genuine CC system prompt + tools. What
+these runs taught us about DeepSeek's cache (it re-renders before caching; cache
+identity includes the client header fingerprint; CC's per-request billing nonce)
+is in [`docs/e2e-findings.md`](docs/e2e-findings.md).
+
+<details>
+<summary><b>Offline benchmark + earlier probes (no API key)</b></summary>
+
+Emulator of DeepSeek's prefix cache (prefix-from-byte-0, block-quantized),
+replaying a 12-turn Claude-Code-shaped conversation. `off` = no alignment;
+`aggressive` = the default.
 
 | Scenario | Mode | Cache hit rate | Anchor resets | Cost (USD) |
 |---|---|---:|---:|---:|
@@ -109,6 +133,19 @@ held the anchor stable despite the naive-client churn — including over the
 > "Anchor resets" = how many times the `tools+system` prefix changed bytes across
 > the run. Each reset forces DeepSeek to re-read the whole prefix at full price.
 > Permafrost's job is to keep it at 0.
+
+</details>
+
+## Features
+
+| | |
+|---|---|
+| **Prefix alignment** | deterministic tool sort · `cache_control` strip · env freeze+delta · billing-nonce stabilization · canonical UTF-8 serialization |
+| **Cold-anchor coalescing** | parallel subagent fan-out shares one cache write instead of N cold misses (first-byte or completion release) |
+| **Idle keepalive** | opt-in per-session replay keeps the prefix warm through think-time gaps (parallel sessions all stay warm) |
+| **Live diagnostics** | `/permafrost:status` `:doctor` `:benchmark` savings statusline · per-session + per-lineage stats · byte-level anchor diffs |
+| **Engineering** | zero deps (stdlib Python) · pooled upstream connections (no per-request TLS) · loopback-only control endpoints · streaming passthrough |
+| **Distribution** | one-line plugin install · SessionStart auto-start hook · `permafrost wrap` / `up` / `status` / `doctor` / `warm` / `bench` CLI |
 
 ## Quick start
 
