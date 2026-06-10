@@ -33,6 +33,36 @@ byte-identical turn after turn — then streams the reply straight back.
                                           + record hits       both speak Anthropic)
 ```
 
+## The math: same workload, four ways
+
+The exact token traffic from our real Claude Code e2e run (4 requests: 41,728
+cache-hit + 21,339 cache-miss input tokens, 591 output tokens), priced four ways
+at current official rates:
+
+| Same workload on… | Cost | vs. Claude w/ caching |
+|---|---:|---:|
+| Claude Sonnet 4.6, caching busted | $0.1981 | — |
+| Claude Sonnet 4.6, native caching working (66% hit) | $0.1014 | 1× |
+| DeepSeek v4-flash, bare env-var switch (cache all-miss) | $0.00896 † | **11× cheaper** |
+| **DeepSeek v4-flash + Permafrost (66% hit)** | **$0.00324 †** | **31× cheaper (−96.8%)** |
+
+† live-measured, not estimated. The 31× factors cleanly: **11× from DeepSeek's
+pricing × 2.8× from Permafrost** keeping the cache hitting. Unit prices behind
+it (USD/1M tokens): cache-hit input $0.30 vs **$0.0028** (107×), miss input
+$3.00 vs $0.14 (21×), output $15 vs $0.28 (54×). On the Opus tier
+(`claude-opus*` maps to v4-pro) the same workload goes $0.169 → $0.0099, **17×
+cheaper**.
+
+A neat cross-check: Claude Code itself priced one of our e2e requests at
+`total_cost_usd: $0.0625` (its own Sonnet-rate accounting); the same request
+through Permafrost → DeepSeek billed **$0.0029**.
+
+> **Honest caveats:** (1) this compares *price for identical traffic*, not model
+> quality — `deepseek-v4-flash` is not Claude Sonnet 4.6; whether the trade is
+> worth it is your call. (2) It's API-metered vs. API-metered; Claude Max
+> subscriptions price differently. (3) Rows 1→3 are DeepSeek's pricing doing the
+> work; rows 3→4 (−64%) are what Permafrost adds on top.
+
 ## Proof
 
 Offline benchmark against a faithful emulator of DeepSeek's prefix cache
